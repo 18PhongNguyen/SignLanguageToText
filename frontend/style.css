@@ -1,0 +1,158 @@
+/* =============================================
+   SL2Text — Frontend Styles
+   ============================================= */
+
+:root {
+    --bg:       #0f1117;
+    --surface:  #1a1d27;
+    --border:   #2a2d3a;
+    --primary:  #4f8cff;
+    --danger:   #ff4f5e;
+    --success:  #00c48c;
+    --warning:  #ffb84f;
+    --text:     #e4e6f0;
+    --text-dim: #8b8fa3;
+    --radius:   10px;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+/* ── Header ──────────────────────────────────── */
+header {
+    text-align: center;
+    padding: 1.5rem 1rem 0.5rem;
+}
+header h1 {
+    font-size: 1.8rem;
+    letter-spacing: -0.5px;
+}
+header p {
+    color: var(--text-dim);
+    font-size: 0.9rem;
+    margin-top: 0.3rem;
+}
+
+/* ── Main ────────────────────────────────────── */
+main {
+    width: 100%;
+    max-width: 720px;
+    padding: 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 1.2rem;
+}
+
+/* ── Video ───────────────────────────────────── */
+.video-section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+}
+
+.video-container {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 4 / 3;
+    background: #000;
+}
+.video-container video,
+.video-container canvas {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+.video-container canvas {
+    pointer-events: none;
+}
+
+/* ── Badge ───────────────────────────────────── */
+.badge {
+    position: absolute;
+    top: 10px; right: 10px;
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    backdrop-filter: blur(6px);
+}
+.badge.disconnected { background: rgba(255,79,94,0.25); color: var(--danger); }
+.badge.connected    { background: rgba(0,196,140,0.25); color: var(--success); }
+.badge.loading      { background: rgba(255,184,79,0.25); color: var(--warning); }
+.badge.ready        { background: rgba(79,140,255,0.25); color: var(--primary); }
+.badge.error        { background: rgba(255,79,94,0.4);  color: #fff; }
+
+/* ── Controls ────────────────────────────────── */
+.controls {
+    display: flex;
+    gap: 0.6rem;
+    padding: 0.8rem;
+    justify-content: center;
+}
+
+.btn {
+    padding: 0.55rem 1.8rem;
+    border: none;
+    border-radius: 6px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.15s;
+}
+.btn:disabled { opacity: 0.4; cursor: default; }
+.btn-primary  { background: var(--primary); color: #fff; }
+.btn-danger   { background: var(--danger);  color: #fff; }
+.btn:not(:disabled):hover { opacity: 0.85; }
+
+/* ── Output ──────────────────────────────────── */
+.output-section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem;
+}
+.output-section h2 {
+    font-size: 1rem;
+    margin-bottom: 0.6rem;
+    color: var(--text-dim);
+}
+
+.text-box {
+    min-height: 100px;
+    max-height: 200px;
+    overflow-y: auto;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.8rem;
+    font-size: 1.1rem;
+    line-height: 1.6;
+}
+.text-box .placeholder {
+    color: var(--text-dim);
+    font-style: italic;
+}
+.detected-text {
+    color: var(--success);
+}
+
+/* ── Stats ───────────────────────────────────── */
+.stats {
+    display: flex;
+    gap: 1.2rem;
+    margin-top: 0.6rem;
+    font-size: 0.78rem;
+    color: var(--text-dim);
+}

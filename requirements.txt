@@ -1,0 +1,24 @@
+# ==========================================
+# 1. DATA COLLECTION & PREPROCESSING (Thị giác máy & Xử lý số liệu)
+# ==========================================
+opencv-python>=4.8.0      # Giao tiếp Webcam, xử lý khung hình ảnh
+mediapipe>=0.10.30        # Tasks API — Pose/Hand/Face Landmarker
+numpy>=1.24.3             # Xử lý ma trận, tensor và lưu file .npy
+pandas>=2.0.3             # Đọc/ghi file CSV quản lý nhãn (labels)
+
+# ==========================================
+# 2. DEEP LEARNING (Huấn luyện & Inference)
+# ==========================================
+torch>=2.1.0              # Bi-LSTM + CTC Loss
+loguru>=0.7.0             # Logging thay thế print
+
+# ==========================================
+# 3. BACKEND (Server API thời gian thực)
+# ==========================================
+fastapi>=0.104.0          # REST + WebSocket API
+uvicorn[standard]>=0.24.0 # ASGI server
+
+# ==========================================
+# 4. TTS (Text-to-Speech)
+# ==========================================
+edge-tts>=6.1.0           # Microsoft Edge TTS (hỗ trợ tiếng Việt)
