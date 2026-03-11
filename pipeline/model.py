@@ -6,10 +6,10 @@ import torch.nn as nn
 
 
 class BiLSTMCTC(nn.Module):
-    """Bidirectional LSTM với CTC output layer.
+    """Bidirectional LSTM với CTC output (word-level translation).
 
     Input:  (batch, time_steps, feature_dim)
-    Output: (batch, time_steps, num_classes + 1)   — log-softmax
+    Output: (batch, time_steps, num_classes)  — log-probabilities per frame
     """
 
     def __init__(
@@ -19,8 +19,12 @@ class BiLSTMCTC(nn.Module):
         num_classes: int = 100,
         num_layers: int = 2,
         dropout: float = 0.3,
+        input_dropout: float = 0.1,
     ) -> None:
         super().__init__()
+
+        # Input dropout: ngẫu nhiên zero toàn bộ feature dim → model robust hơn
+        self.input_dropout = nn.Dropout(input_dropout)
 
         # Linear projection: feature_dim → hidden_dim
         self.projection = nn.Sequential(
@@ -41,18 +45,19 @@ class BiLSTMCTC(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-        # FC output: hidden_dim*2 (bidirectional) → num_classes + 1 (blank)
-        self.fc = nn.Linear(hidden_dim * 2, num_classes + 1)
+        # FC: hidden_dim*2 (bidirectional) → num_classes (per frame)
+        self.fc = nn.Linear(hidden_dim * 2, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: (batch, T, feature_dim)
         Returns:
-            log_probs: (batch, T, num_classes + 1)
+            log_probs: (batch, T, num_classes)  — log-softmax per frame
         """
+        x = self.input_dropout(x)    # Input regularization
         x = self.projection(x)       # (B, T, hidden)
         x, _ = self.lstm(x)          # (B, T, hidden*2)
         x = self.dropout(x)
-        x = self.fc(x)               # (B, T, C)
-        return x.log_softmax(dim=-1)
+        x = self.fc(x)               # (B, T, num_classes)
+        return x

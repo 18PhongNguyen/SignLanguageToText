@@ -44,7 +44,8 @@ FACE_MODEL_URL: str = (
 # ==========================================
 # TRÍCH XUẤT ĐẶC TRƯNG (FEATURE EXTRACTION)
 # ==========================================
-USE_FACE: bool = True  # Bật/tắt face landmarks
+USE_FACE: bool = False  # Tắt face — 1434-dim face là nhiễu cho nhận diện cử chỉ tay
+USE_EYEBROW: bool = True  # Bật lông mày — quan trọng cho biểu cảm và ngữ pháp VSL
 
 NUM_POSE_LANDMARKS: int = 33
 NUM_HAND_LANDMARKS: int = 21
@@ -56,20 +57,29 @@ FACE_DIMS: int = 3   # x, y, z
 
 POSE_FEATURE_DIM: int = NUM_POSE_LANDMARKS * POSE_DIMS   # 132
 HAND_FEATURE_DIM: int = NUM_HAND_LANDMARKS * HAND_DIMS   # 63
+HAND_ANGLE_DIM: int = 5                                   # 5 góc PIP mỗi bàn tay
 FACE_FEATURE_DIM: int = NUM_FACE_LANDMARKS * FACE_DIMS   # 1434
+EYEBROW_FEATURE_DIM: int = 33  # 5×3 + 5×3 + 3 (coords lông mày + raise + furrow)
 
 
-def compute_feature_dim(use_face: bool = USE_FACE) -> int:
+def compute_feature_dim(
+    use_face: bool = USE_FACE,
+    use_eyebrow: bool = USE_EYEBROW,
+) -> int:
     """Tính tổng số chiều đặc trưng mỗi frame."""
-    dim = POSE_FEATURE_DIM + 2 * HAND_FEATURE_DIM  # pose + 2 tay
+    # pose + (tọa độ + góc ngón tay) × 2 tay
+    dim = POSE_FEATURE_DIM + 2 * (HAND_FEATURE_DIM + HAND_ANGLE_DIM)
     if use_face:
         dim += FACE_FEATURE_DIM
+    if use_eyebrow:
+        dim += EYEBROW_FEATURE_DIM
     return dim
 
 
 FEATURE_DIM: int = compute_feature_dim()
-# USE_FACE=True  → 132 + 126 + 1434 = 1692
-# USE_FACE=False → 132 + 126       = 258
+# USE_FACE=False, USE_EYEBROW=True  → 132 + 2×(63+5) + 33 = 301
+# USE_FACE=False, USE_EYEBROW=False → 132 + 2×(63+5)      = 268
+# USE_FACE=True,  USE_EYEBROW=True  → 132 + 2×(63+5) + 1434 + 33 = 1735
 
 # ==========================================
 # MÔ HÌNH BI-LSTM
@@ -87,53 +97,45 @@ NUM_EPOCHS: int = 100
 SCHEDULER_PATIENCE: int = 5
 SCHEDULER_FACTOR: float = 0.5
 MIN_SEQUENCE_LENGTH: int = 10  # Số frame tối thiểu
+WEIGHT_DECAY: float = 1e-4     # L2 regularization (AdamW)
+INPUT_DROPOUT: float = 0.1     # Dropout trên input features trước projection
 
 # ==========================================
 # SLIDING WINDOW (INFERENCE THỜI GIAN THỰC)
 # ==========================================
-WINDOW_SIZE: int = 30   # frames
-WINDOW_STRIDE: int = 5  # frames
+WINDOW_SIZE: int = 60   # frames — đủ bao phủ cử chỉ dài nhất (~99 max, mean ~53)
+WINDOW_STRIDE: int = 10  # frames
+
+# Số lần inference liên tiếp phải cho cùng kết quả trước khi emit
+# (tránh kết quả lộn xộn khi model đang ở giữa cử chỉ)
+STABLE_THRESHOLD: int = 3
 
 # ==========================================
-# VOCABULARY — Tiếng Việt
-# Blank token ở index 0 theo chuẩn CTC.
+# VOCABULARY — Word-level CTC
+# Từ điển tự động xây dựng từ labels.csv → vocab.txt
+# Mỗi từ đơn là một token, index 0 = <blank> (CTC blank).
+#
+# Khi thu thêm dữ liệu: chạy build_vocab() hoặc
+# data_collector.py tự gọi khi lưu nhãn mới.
 # ==========================================
-_VIETNAMESE_CHARS: str = (
-    " "
-    "aàáảãạăằắẳẵặâầấẩẫậ"
-    "bcd"
-    "đ"
-    "eèéẻẽẹêềếểễệ"
-    "fgh"
-    "iìíỉĩị"
-    "jklmn"
-    "oòóỏõọôồốổỗộơờớởỡợ"
-    "pqrst"
-    "uùúủũụưừứửữự"
-    "vwx"
-    "yỳýỷỹỵ"
-    "z"
-    "0123456789"
-    ".,!?-"
-)
+from vocab import load_vocab, vocab_to_dicts, BLANK_TOKEN  # noqa: E402
 
-BLANK_TOKEN: str = "<blank>"
-VOCAB: list[str] = [BLANK_TOKEN] + list(_VIETNAMESE_CHARS)
-CHAR_TO_IDX: dict[str, int] = {ch: i for i, ch in enumerate(VOCAB)}
-IDX_TO_CHAR: dict[int, str] = {i: ch for i, ch in enumerate(VOCAB)}
-NUM_CLASSES: int = len(VOCAB) - 1   # không tính blank
+VOCAB: list[str] = load_vocab()
+
 BLANK_IDX: int = 0
+NUM_CLASSES: int = len(VOCAB)   # blank + N words
+
+CHAR_TO_IDX: dict[str, int]
+IDX_TO_CHAR: dict[int, str]
+CHAR_TO_IDX, IDX_TO_CHAR = vocab_to_dicts(VOCAB)
 
 
-def text_to_indices(text: str) -> list[int]:
-    """Chuyển chuỗi tiếng Việt → danh sách index (bỏ ký tự ngoài vocab)."""
-    text = unicodedata.normalize("NFC", text.lower())
-    return [CHAR_TO_IDX[ch] for ch in text if ch in CHAR_TO_IDX]
-
-
-def indices_to_text(indices: list[int]) -> str:
-    """Chuyển danh sách index → chuỗi (bỏ blank)."""
-    return "".join(IDX_TO_CHAR.get(i, "") for i in indices if i != BLANK_IDX)
+def reload_vocab() -> None:
+    """Tải lại vocab sau khi build_vocab() cập nhật vocab.txt."""
+    global VOCAB, NUM_CLASSES, CHAR_TO_IDX, IDX_TO_CHAR
+    VOCAB = load_vocab()
+    NUM_CLASSES = len(VOCAB)
+    CHAR_TO_IDX, IDX_TO_CHAR = vocab_to_dicts(VOCAB)
 
 
 # ==========================================

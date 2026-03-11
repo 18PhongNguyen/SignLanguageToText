@@ -1,93 +1,134 @@
-/**
- * SL2Text — Frontend Application
+﻿/**
+ * SL2Text Frontend — Frontend MediaPipe mode
  *
- * Sử dụng MediaPipe Vision Tasks (JS) để trích xuất landmarks
- * trên browser, sau đó gửi qua WebSocket tới backend.
+ * Dùng @mediapipe/tasks-vision JS để extract landmarks ngay trên browser,
+ * gửi JSON qua WebSocket /ws/recognize.
+ *
+ * === NHẤT QUÁN VỚI data_collector.py ===
+ * 1. Frame được flip ngang TRƯỚC khi đưa vào MediaPipe
+ *    → giống `image = cv2.flip(frame, 1)` trong Python
+ * 2. Handedness "Left"/"Right" từ image-perspective (sau flip)
+ *    → khớp với cách data_collector.py phân loại tay
+ * 3. Pose: [x, y, z, visibility] × 33
+ * 4. Hand: [x, y, z] × 21
+ * 5. Face: [x, y, z] × 478 (server dùng để tính eyebrow features)
  */
 
-import { FilesetResolver, PoseLandmarker, HandLandmarker, FaceLandmarker }
-    from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21/vision_bundle.mjs";
+// ── DOM ──────────────────────────────────────────────────────────────────────
+const video       = document.getElementById("webcam");
+const canvas      = document.getElementById("overlay");
+const ctx         = canvas.getContext("2d");
+const btnStart    = document.getElementById("btn-start");
+const btnStop     = document.getElementById("btn-stop");
+const statusBadge = document.getElementById("status-badge");
+const textOutput  = document.getElementById("text-output");
+const audioPlayer = document.getElementById("audio-player");
+const statFps     = document.getElementById("stat-fps");
+const statLatency = document.getElementById("stat-latency");
+const statFrames  = document.getElementById("stat-frames");
 
-// ── DOM Elements ────────────────────────────────────────────
-const video        = document.getElementById("webcam");
-const canvas       = document.getElementById("overlay");
-const ctx          = canvas.getContext("2d");
-const btnStart     = document.getElementById("btn-start");
-const btnStop      = document.getElementById("btn-stop");
-const statusBadge  = document.getElementById("status-badge");
-const textOutput   = document.getElementById("text-output");
-const audioPlayer  = document.getElementById("audio-player");
-const statFps      = document.getElementById("stat-fps");
-const statLatency  = document.getElementById("stat-latency");
-const statFrames   = document.getElementById("stat-frames");
+// ── Config ────────────────────────────────────────────────────────────────────
+const TARGET_FPS     = 15;
+const FRAME_INTERVAL = Math.round(1000 / TARGET_FPS);
+const MIN_POSE_CONF  = 0.35;
+const MIN_HAND_CONF  = 0.35;
+const MIN_FACE_CONF  = 0.35;
+const MIN_TRACKING   = 0.30;
 
-// ── State ───────────────────────────────────────────────────
-let poseLandmarker  = null;
-let handLandmarker  = null;
-let faceLandmarker  = null;
-let ws              = null;
-let running         = false;
-let frameCount      = 0;
-let lastFpsTime     = performance.now();
-let fpsCount        = 0;
+// Serve từ local (tránh CDN chậm)
+const WASM_BASE  = "/mediapipe/wasm";
+const MODEL_BASE = "/models";
 
-// ── MediaPipe Connections (để vẽ) ───────────────────────────
-const POSE_CONNECTIONS = [
-    [0,1],[1,2],[2,3],[3,7],[0,4],[4,5],[5,6],[6,8],[9,10],
-    [11,12],[11,13],[13,15],[15,17],[15,19],[15,21],[17,19],
-    [12,14],[14,16],[16,18],[16,20],[16,22],[18,20],
-    [11,23],[12,24],[23,24],[23,25],[24,26],
-    [25,27],[26,28],[27,29],[28,30],[29,31],[30,32],[27,31],[28,32],
-];
-const HAND_CONNECTIONS = [
-    [0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],
-    [5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],
-    [13,17],[17,18],[18,19],[19,20],[0,17],
-];
+// ── State ─────────────────────────────────────────────────────────────────────
+let ws          = null;
+let running     = false;
+let frameCount  = 0;
+let fpsCount    = 0;
+let lastFpsTime = performance.now();
+let frameTimer  = null;
+let mpReady     = false;
 
-// ── Khởi tạo MediaPipe ─────────────────────────────────────
+// MediaPipe objects — được gán sau dynamic import
+let PoseLandmarker, HandLandmarker, FaceLandmarker, DrawingUtils;
+let poseLandmarker = null;
+let handLandmarker = null;
+let faceLandmarker = null;
+
+// Canvas ẩn để detect (flip ngang + giảm resolution 2× trước khi detect)
+// Giống data_collector.py: resize về W//2 × H//2 → 4× ít pixel → nhanh hơn ~2-3×
+const detectCanvas = document.createElement("canvas");
+const detectCtx    = detectCanvas.getContext("2d", { willReadFrequently: true });
+
+// Pose thay đổi chậm → cache kết quả, chỉ chạy mỗi 2 frame
+let _cachedPoseResult = null;
+let _poseFrameCounter = 0;
+const POSE_SKIP = 2;
+
+// ── Khởi tạo MediaPipe Tasks Vision ──────────────────────────────────────────
 async function initMediaPipe() {
-    statusBadge.textContent = "Đang tải model...";
-    statusBadge.className = "badge loading";
+    statusBadge.textContent = "Đang tải MediaPipe...";
+    statusBadge.className   = "badge loading";
 
-    const vision = await FilesetResolver.forVisionTasks(
-        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21/wasm"
-    );
+    let vision;
+    try {
+        const mod = await import("/mediapipe/vision_bundle.mjs");
+        PoseLandmarker = mod.PoseLandmarker;
+        HandLandmarker = mod.HandLandmarker;
+        FaceLandmarker = mod.FaceLandmarker;
+        DrawingUtils   = mod.DrawingUtils;
+        const { FilesetResolver } = mod;
+        vision = await FilesetResolver.forVisionTasks(WASM_BASE);
+    } catch (err) {
+        console.error("[MP] Lỗi tải thư viện:", err);
+        statusBadge.textContent = "Lỗi tải MediaPipe";
+        statusBadge.className   = "badge error";
+        btnStart.disabled = false;
+        throw err;
+    }
 
-    poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
-        baseOptions: {
-            modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
-            delegate: "GPU",
-        },
-        runningMode: "VIDEO",
-        numPoses: 1,
-    });
+    try {
+        [poseLandmarker, handLandmarker, faceLandmarker] = await Promise.all([
+            PoseLandmarker.createFromOptions(vision, {
+                baseOptions: { modelAssetPath: `${MODEL_BASE}/pose_landmarker_full.task`, delegate: "CPU" },
+                runningMode: "VIDEO",
+                numPoses: 1,
+                minPoseDetectionConfidence: MIN_POSE_CONF,
+                minPosePresenceConfidence:  MIN_POSE_CONF,
+                minTrackingConfidence:      MIN_TRACKING,
+            }),
+            HandLandmarker.createFromOptions(vision, {
+                baseOptions: { modelAssetPath: `${MODEL_BASE}/hand_landmarker.task`, delegate: "CPU" },
+                runningMode: "VIDEO",
+                numHands: 2,
+                minHandDetectionConfidence: MIN_HAND_CONF,
+                minHandPresenceConfidence:  MIN_HAND_CONF,
+                minTrackingConfidence:      MIN_TRACKING,
+            }),
+            FaceLandmarker.createFromOptions(vision, {
+                baseOptions: { modelAssetPath: `${MODEL_BASE}/face_landmarker.task`, delegate: "CPU" },
+                runningMode: "VIDEO",
+                numFaces: 1,
+                minFaceDetectionConfidence: MIN_FACE_CONF,
+                minFacePresenceConfidence:  MIN_FACE_CONF,
+                minTrackingConfidence:      MIN_TRACKING,
+            }),
+        ]);
+    } catch (err) {
+        console.error("[MP] Lỗi tải model:", err);
+        statusBadge.textContent = "Lỗi tải model";
+        statusBadge.className   = "badge error";
+        btnStart.disabled = false;
+        throw err;
+    }
 
-    handLandmarker = await HandLandmarker.createFromOptions(vision, {
-        baseOptions: {
-            modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task",
-            delegate: "GPU",
-        },
-        runningMode: "VIDEO",
-        numHands: 2,
-    });
-
-    faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
-        baseOptions: {
-            modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task",
-            delegate: "GPU",
-        },
-        runningMode: "VIDEO",
-        numFaces: 1,
-        outputFaceBlendshapes: false,
-    });
-
+    mpReady = true;
+    btnStart.disabled = false;
     statusBadge.textContent = "Sẵn sàng";
-    statusBadge.className = "badge ready";
-    console.log("[SL2Text] MediaPipe loaded");
+    statusBadge.className   = "badge ready";
+    console.log("[MP] MediaPipe ready — local models");
 }
 
-// ── Webcam ──────────────────────────────────────────────────
+// ── Webcam ────────────────────────────────────────────────────────────────────
 async function startWebcam() {
     const stream = await navigator.mediaDevices.getUserMedia({
         video: { width: 640, height: 480, facingMode: "user" },
@@ -95,8 +136,13 @@ async function startWebcam() {
     });
     video.srcObject = stream;
     await video.play();
-    canvas.width  = video.videoWidth;
-    canvas.height = video.videoHeight;
+    const w = video.videoWidth  || 640;
+    const h = video.videoHeight || 480;
+    canvas.width  = w;
+    canvas.height = h;
+    // detectCanvas chạy ở half resolution — 4× ít pixel, landmark vẫn chuẩn vì normalize [0,1]
+    detectCanvas.width  = Math.round(w / 2);
+    detectCanvas.height = Math.round(h / 2);
 }
 
 function stopWebcam() {
@@ -106,52 +152,147 @@ function stopWebcam() {
     }
 }
 
-// ── WebSocket ───────────────────────────────────────────────
+// ── WebSocket ─────────────────────────────────────────────────────────────────
 function connectWS() {
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${protocol}//${location.host}/ws/recognize`;
-    ws = new WebSocket(wsUrl);
+    ws = new WebSocket(`${protocol}//${location.host}/ws/recognize`);
 
     ws.onopen = () => {
         statusBadge.textContent = "Đang nhận diện";
-        statusBadge.className = "badge connected";
-        console.log("[WS] Connected");
+        statusBadge.className   = "badge connected";
+        console.log("[WS] Connected → /ws/recognize");
     };
 
-    ws.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        if (data.text) {
-            appendText(data.text);
-        }
-        if (data.audio) {
-            playAudio(data.audio);
-        }
-        if (data.latency_ms) {
-            statLatency.textContent = `Latency: ${data.latency_ms} ms`;
+    ws.onmessage = ({ data }) => {
+        try {
+            const msg = JSON.parse(data);
+            if (msg.text)  appendText(msg.text);
+            if (msg.audio) playAudio(msg.audio);
+            if (msg.latency_ms != null)
+                statLatency.textContent = "Latency: " + msg.latency_ms + " ms";
+        } catch (e) {
+            console.error("[WS] parse error:", e);
         }
     };
 
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
         statusBadge.textContent = "Mất kết nối";
-        statusBadge.className = "badge disconnected";
+        statusBadge.className   = "badge disconnected";
+        console.warn("[WS] Closed", ev.code, ev.reason);
     };
 
-    ws.onerror = (err) => {
-        console.error("[WS] Error:", err);
-    };
+    ws.onerror = (err) => console.error("[WS] Error:", err);
 }
 
 function disconnectWS() {
     if (ws) { ws.close(); ws = null; }
 }
 
-// ── Output helpers ──────────────────────────────────────────
+// ── Detect + Send frame ───────────────────────────────────────────────────────
+function sendFrame() {
+    if (!running || !ws || ws.readyState !== WebSocket.OPEN) return;
+    if (video.readyState < 2) return;
+
+    const now = performance.now();
+
+    if (!mpReady) {
+        // MediaPipe chưa sẵn sàng — chỉ hiển thị video mirror
+        ctx.save();
+        ctx.scale(-1, 1);
+        ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
+        ctx.restore();
+        frameCount++;
+        statFrames.textContent = "Frames: " + frameCount;
+        return;
+    }
+
+    // QUAN TRỌNG: flip ngang + downscale 2× trước khi detect
+    // Khớp với data_collector.py: resize về W//2 × H//2 rồi flip
+    detectCtx.save();
+    detectCtx.scale(-1, 1);
+    detectCtx.drawImage(video, -detectCanvas.width, 0, detectCanvas.width, detectCanvas.height);
+    detectCtx.restore();
+
+    // Pose chỉ cập nhật mỗi POSE_SKIP frame (thay đổi chậm)
+    _poseFrameCounter++;
+    if (_poseFrameCounter % POSE_SKIP === 0 || _cachedPoseResult === null) {
+        _cachedPoseResult = poseLandmarker.detectForVideo(detectCanvas, now);
+    }
+    const poseResult = _cachedPoseResult;
+    const handResult = handLandmarker.detectForVideo(detectCanvas, now);
+    const faceResult = faceLandmarker.detectForVideo(detectCanvas, now);
+
+    // Build JSON khớp với landmarks_json_to_array trong extractor.py
+    const landmarks = { pose: null, left_hand: null, right_hand: null, face: null };
+
+    if (poseResult.landmarks.length > 0) {
+        landmarks.pose = poseResult.landmarks[0].map(lm => [
+            lm.x, lm.y, lm.z, lm.visibility ?? 1.0,
+        ]);
+    }
+
+    handResult.landmarks.forEach((lms, i) => {
+        const label  = handResult.handednesses[i]?.[0]?.categoryName ?? "";
+        const coords = lms.map(lm => [lm.x, lm.y, lm.z]);
+        if (label === "Left")       landmarks.left_hand  = coords;
+        else if (label === "Right") landmarks.right_hand = coords;
+    });
+
+    if (faceResult.faceLandmarks.length > 0) {
+        landmarks.face = faceResult.faceLandmarks[0].map(lm => [lm.x, lm.y, lm.z]);
+    }
+
+    ws.send(JSON.stringify({ frame_id: frameCount, timestamp: Date.now() / 1000, landmarks }));
+
+    drawSkeleton(poseResult, handResult);
+
+    frameCount++;
+    fpsCount++;
+    statFrames.textContent = "Frames: " + frameCount;
+    const elapsed = now - lastFpsTime;
+    if (elapsed >= 1000) {
+        statFps.textContent = "FPS: " + Math.round(fpsCount * 1000 / elapsed);
+        fpsCount    = 0;
+        lastFpsTime = now;
+    }
+}
+
+// ── Vẽ skeleton lên overlay ───────────────────────────────────────────────────
+function drawSkeleton(poseResult, handResult) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (!DrawingUtils) return;
+
+    // Landmarks detect trên canvas đã flip → mirror lại khi vẽ
+    ctx.save();
+    ctx.scale(-1, 1);
+    ctx.translate(-canvas.width, 0);
+
+    const drawUtils = new DrawingUtils(ctx);
+
+    if (poseResult.landmarks.length > 0) {
+        drawUtils.drawConnectors(
+            poseResult.landmarks[0],
+            PoseLandmarker.POSE_CONNECTIONS,
+            { color: "#00FF00", lineWidth: 1 },
+        );
+        drawUtils.drawLandmarks(poseResult.landmarks[0], { color: "#FF0000", radius: 2 });
+    }
+
+    handResult.landmarks.forEach(lms => {
+        drawUtils.drawConnectors(lms, HandLandmarker.HAND_CONNECTIONS,
+            { color: "#00BFFF", lineWidth: 2 });
+        drawUtils.drawLandmarks(lms, { color: "#FF69B4", radius: 3 });
+    });
+
+    ctx.restore();
+}
+
+// ── Output helpers ────────────────────────────────────────────────────────────
 function appendText(text) {
     const placeholder = textOutput.querySelector(".placeholder");
     if (placeholder) placeholder.remove();
-
     const span = document.createElement("span");
-    span.className = "detected-text";
+    span.className   = "detected-text";
     span.textContent = text + " ";
     textOutput.appendChild(span);
     textOutput.scrollTop = textOutput.scrollHeight;
@@ -162,150 +303,45 @@ function playAudio(base64mp3) {
     audioPlayer.play().catch(() => {});
 }
 
-// ── Vẽ landmarks lên canvas ─────────────────────────────────
-function drawResults(poseResult, handResult, faceResult) {
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    const w = canvas.width, h = canvas.height;
-
-    // Pose
-    if (poseResult?.landmarks?.length) {
-        for (const landmarks of poseResult.landmarks) {
-            drawConnectors(landmarks, POSE_CONNECTIONS, "#00FF00", 2);
-            drawDots(landmarks, "#00FF00", 3);
-        }
-    }
-    // Hands
-    if (handResult?.landmarks?.length) {
-        for (const landmarks of handResult.landmarks) {
-            drawConnectors(landmarks, HAND_CONNECTIONS, "#FFFFFF", 2);
-            drawDots(landmarks, "#FF6600", 4);
-        }
-    }
-    // Face (chỉ vẽ điểm, không vẽ đường nối vì quá nhiều)
-    if (faceResult?.faceLandmarks?.length) {
-        for (const landmarks of faceResult.faceLandmarks) {
-            drawDots(landmarks, "#00CCFF", 1);
-        }
-    }
-
-    function drawDots(landmarks, color, radius) {
-        ctx.fillStyle = color;
-        for (const lm of landmarks) {
-            ctx.beginPath();
-            ctx.arc(lm.x * w, lm.y * h, radius, 0, 2 * Math.PI);
-            ctx.fill();
-        }
-    }
-
-    function drawConnectors(landmarks, connections, color, lineWidth) {
-        ctx.strokeStyle = color;
-        ctx.lineWidth = lineWidth;
-        for (const [s, e] of connections) {
-            if (s < landmarks.length && e < landmarks.length) {
-                ctx.beginPath();
-                ctx.moveTo(landmarks[s].x * w, landmarks[s].y * h);
-                ctx.lineTo(landmarks[e].x * w, landmarks[e].y * h);
-                ctx.stroke();
-            }
-        }
-    }
-}
-
-// ── Frame loop ──────────────────────────────────────────────
-function processFrame() {
-    if (!running) return;
-
-    const now = performance.now();
-    const timestamp = Math.round(now);
-
-    // MediaPipe detection
-    const poseResult = poseLandmarker.detectForVideo(video, timestamp);
-    const handResult = handLandmarker.detectForVideo(video, timestamp);
-    const faceResult = faceLandmarker.detectForVideo(video, timestamp);
-
-    drawResults(poseResult, handResult, faceResult);
-
-    // Xây dựng payload landmarks
-    const payload = buildPayload(poseResult, handResult, faceResult, timestamp);
-
-    // Gửi qua WebSocket
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify(payload));
-    }
-
-    // Stats
-    frameCount++;
-    fpsCount++;
-    statFrames.textContent = `Frames: ${frameCount}`;
-
-    if (now - lastFpsTime >= 1000) {
-        statFps.textContent = `FPS: ${fpsCount}`;
-        fpsCount = 0;
-        lastFpsTime = now;
-    }
-
-    requestAnimationFrame(processFrame);
-}
-
-function buildPayload(poseResult, handResult, faceResult, timestamp) {
-    // Pose: 33 landmarks → [[x,y,z,visibility], ...]
-    let pose = null;
-    if (poseResult?.landmarks?.length) {
-        pose = poseResult.landmarks[0].map(lm => [lm.x, lm.y, lm.z, lm.visibility ?? 1.0]);
-    }
-
-    // Hands: phân loại Left/Right theo handedness
-    let left_hand = null, right_hand = null;
-    if (handResult?.landmarks?.length) {
-        for (let i = 0; i < handResult.landmarks.length; i++) {
-            const label = handResult.handednesses[i]?.[0]?.categoryName || "Right";
-            const coords = handResult.landmarks[i].map(lm => [lm.x, lm.y, lm.z]);
-            if (label === "Left") left_hand = coords;
-            else right_hand = coords;
-        }
-    }
-
-    // Face: 478 landmarks → [[x,y,z], ...]
-    let face = null;
-    if (faceResult?.faceLandmarks?.length) {
-        face = faceResult.faceLandmarks[0].map(lm => [lm.x, lm.y, lm.z]);
-    }
-
-    return {
-        frame_id: frameCount,
-        timestamp: timestamp,
-        landmarks: { pose, left_hand, right_hand, face },
-    };
-}
-
-// ── Button handlers ─────────────────────────────────────────
+// ── Button handlers ───────────────────────────────────────────────────────────
 btnStart.addEventListener("click", async () => {
     btnStart.disabled = true;
     btnStop.disabled  = false;
+    statusBadge.textContent = "Đang khởi động...";
+    statusBadge.className   = "badge loading";
 
-    await startWebcam();
-    connectWS();
-    running = true;
-    frameCount = 0;
-    requestAnimationFrame(processFrame);
+    try {
+        await startWebcam();
+        connectWS();
+        running    = true;
+        frameCount = 0;
+        frameTimer = setInterval(sendFrame, FRAME_INTERVAL);
+    } catch (err) {
+        console.error("Lỗi khởi động:", err);
+        statusBadge.textContent = "Lỗi camera";
+        statusBadge.className   = "badge error";
+        btnStart.disabled = false;
+        btnStop.disabled  = true;
+    }
 });
 
 btnStop.addEventListener("click", () => {
     running = false;
+    if (frameTimer) { clearInterval(frameTimer); frameTimer = null; }
     btnStart.disabled = false;
     btnStop.disabled  = true;
-
     disconnectWS();
     stopWebcam();
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-
     statusBadge.textContent = "Đã dừng";
-    statusBadge.className = "badge disconnected";
+    statusBadge.className   = "badge disconnected";
 });
 
-// ── Init ────────────────────────────────────────────────────
+// ── Init ──────────────────────────────────────────────────────────────────────
+btnStart.disabled = true;
 initMediaPipe().catch(err => {
-    console.error("Lỗi khởi tạo MediaPipe:", err);
-    statusBadge.textContent = "Lỗi tải model";
-    statusBadge.className = "badge error";
+    console.error("[MP] Không tải được MediaPipe:", err);
+    btnStart.disabled = false;
+    statusBadge.textContent = "MediaPipe lỗi";
+    statusBadge.className   = "badge error";
 });
