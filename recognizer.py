@@ -32,7 +32,7 @@ from mediapipe.tasks.python import vision as mp_vision
 import config as cfg
 from pipeline.model import BiLSTMCTC
 from pipeline.decoder import decode_to_text, normalize_vietnamese
-from pipeline.extractor import landmarks_to_features
+from pipeline.extractor import landmarks_to_features, augment_sequence_with_velocity
 
 try:
     from PIL import Image as _PilImage, ImageDraw as _PilDraw, ImageFont as _PilFont
@@ -260,6 +260,9 @@ class InferenceEngine:
         self._confidence_threshold: float = 0.30
         self._last_emitted: str = ""
 
+        # Phrase list từ dataset để snap kết quả decode
+        self.phrase_list: list[str] = self._load_phrase_list()
+
         # Load model
         self.model: BiLSTMCTC | None = None
         self.idx2word: dict[int, str] = cfg.IDX_TO_CHAR  # fallback; overridden khi load checkpoint
@@ -297,6 +300,25 @@ class InferenceEngine:
         else:
             print(f"[MODEL] Chưa có model tại {cfg.TRAINED_MODEL_PATH}. Hãy train trước!")
 
+    @staticmethod
+    def _load_phrase_list() -> list[str]:
+        """Đọc danh sách câu duy nhất từ labels.csv để dùng cho phrase snapping."""
+        import unicodedata
+        import pandas as pd
+        label_path = cfg.LABEL_FILE
+        try:
+            df = pd.read_csv(label_path)
+            phrases = sorted({
+                unicodedata.normalize("NFC", str(t).strip().lower())
+                for t in df["text"]
+                if str(t).strip()
+            })
+            print(f"[PHRASE] Loaded {len(phrases)} phrases: {phrases}")
+            return phrases
+        except Exception as e:
+            print(f"[PHRASE] Không thể load phrases: {e}")
+            return []
+
     @torch.no_grad()
     def _run_infer(self) -> tuple[str | None, float]:
         if self.model is None or len(self.frame_buffer) < self._min_infer_frames:
@@ -307,10 +329,13 @@ class InferenceEngine:
         self.frame_buffer.clear()
         self._silence_frames = 0
 
+        if cfg.USE_VELOCITY:
+            window = augment_sequence_with_velocity(window)
+
         x = torch.tensor(window, dtype=torch.float32).unsqueeze(0).to(self.device)
         logits = self.model(x)
 
-        results = decode_to_text(logits, self.idx2word, blank_idx=cfg.BLANK_IDX)
+        results = decode_to_text(logits, self.idx2word, blank_idx=cfg.BLANK_IDX, phrase_list=self.phrase_list)
         text, confidence = results[0]
 
         # Debug: in ra chuỗi token CTC để chẩn đoán xem "khỏe" có bị bỏ qua không

@@ -22,7 +22,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from loguru import logger
 from collections import defaultdict
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset, Subset, WeightedRandomSampler
 
 import config as cfg
 from pipeline.model import BiLSTMCTC
@@ -50,17 +50,17 @@ def augment_batch(
     for i in range(B):
         L = int(input_lengths[i].item())
 
-        # 1. Gaussian noise (50%)
+        # 1. Gaussian noise (50%, σ=0.01)
         if random.random() < 0.5:
             aug[i, :L] += torch.randn(L, D, device=padded.device) * 0.01
 
-        # 2. Feature masking: chặn 5% chiều đặc trưng liên tiếp (50%)
+        # 2. Feature masking: zero out 5% feature dims (50%)
         if random.random() < 0.5:
             n_feat = max(1, int(D * 0.05))
             f_start = random.randint(0, D - n_feat)
             aug[i, :L, f_start : f_start + n_feat] = 0.0
 
-        # 3. Time masking: chặn ≤12.5% frame liên tiếp (50%)
+        # 3. Time masking: zero out ≤12.5% frames (50%)
         if random.random() < 0.5 and L > 20:
             n_time = random.randint(1, max(1, L // 8))
             t_start = random.randint(0, L - n_time)
@@ -93,10 +93,6 @@ class SignLanguageDataset(Dataset):
                 logger.warning(f"File không tồn tại, bỏ qua: {npy_path}")
                 continue
 
-            # Bỏ qua hoàn toàn nhãn "neutral" — không đưa vào huấn luyện
-            if unicodedata.normalize("NFC", text.strip().lower()) == "neutral":
-                continue
-
             indices = text_to_word_indices(text, word2idx)
             if not indices:
                 logger.warning(f"Text không encode được, bỏ qua: {npy_path} → '{text}'")
@@ -106,12 +102,28 @@ class SignLanguageDataset(Dataset):
 
         logger.info(f"Loaded {len(self.samples)} samples từ {label_file}")
 
+        # CTC constraint: T >= 2*L - 1 (tối thiểu để CTC loss tính được)
+        valid = []
+        for path, indices in self.samples:
+            T = np.load(path, mmap_mode='r').shape[0]
+            if T >= 2 * len(indices) - 1:
+                valid.append((path, indices))
+            else:
+                logger.warning(f"Removed (CTC constraint violated): {path} T={T} < {2*len(indices)-1}")
+        self.samples = valid
+        logger.info(f"After CTC filter: {len(self.samples)} valid samples")
+
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         path, target_indices = self.samples[idx]
         features = np.load(path)  # (T, raw_feature_dim)
+
+        # Velocity augmentation: nối delta liên frame → (T, D*2)
+        if cfg.USE_VELOCITY:
+            from pipeline.extractor import augment_sequence_with_velocity
+            features = augment_sequence_with_velocity(features)
 
         # Tương thích ngược: slice/pad nếu feature_dim khác config
         expected = cfg.FEATURE_DIM
@@ -200,12 +212,21 @@ def train(args: argparse.Namespace) -> None:
         n_v = max(1, int(len(idxs) * 0.2))
         logger.info(f"  {label_str!r:40s}  total={len(idxs):4d}  val={n_v:3d}  train={len(idxs)-n_v:4d}")
 
+    # Weighted sampler: oversample minority class ("rất vui được gặp bạn" etc.)
+    class_freq: dict[tuple, int] = defaultdict(int)
+    for i in train_indices:
+        class_freq[tuple(dataset.samples[i][1])] += 1
+    sample_weights = torch.tensor(
+        [(1.0 / class_freq[tuple(dataset.samples[i][1])]) ** 0.5 for i in train_indices],
+        dtype=torch.float32,
+    )
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        sampler=WeightedRandomSampler(sample_weights, len(sample_weights)),
         collate_fn=collate_fn,
         num_workers=0,
+        pin_memory=device.type == "cuda",
     )
     val_loader = DataLoader(
         val_ds,
@@ -213,6 +234,7 @@ def train(args: argparse.Namespace) -> None:
         shuffle=False,
         collate_fn=collate_fn,
         num_workers=0,
+        pin_memory=device.type == "cuda",
     )
 
     # ── Model ──────────────────────────────────────────────────
@@ -232,12 +254,14 @@ def train(args: argparse.Namespace) -> None:
         lr=args.lr,
         weight_decay=cfg.WEIGHT_DECAY,
     )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=cfg.SCHEDULER_FACTOR,
-        patience=cfg.SCHEDULER_PATIENCE,
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=args.epochs,
+        eta_min=1e-6,
     )
 
     os.makedirs(cfg.MODELS_DIR, exist_ok=True)
+    best_val_wer = float("inf")
     best_val_loss = float("inf")
     no_improve_count = 0
 
@@ -332,7 +356,7 @@ def train(args: argparse.Namespace) -> None:
                     ref_words = [idx2word.get(j, "") for j in tgt]
 
                     results = decode_to_text(
-                        logits[i].unsqueeze(0),
+                        logits[i].unsqueeze(0).cpu(),
                         idx2word,
                         blank_idx=0,
                         beam_width=5,    # beam nhỏ cho train (nhanh hơn)
@@ -340,7 +364,9 @@ def train(args: argparse.Namespace) -> None:
                         confidence_threshold=0.0,  # không lọc confidence khi validation
                     )
                     decoded_str = results[0][0] if results and results[0][0] else ""
-                    decoded_words = decoded_str.split() if decoded_str else []
+                    # Lowercase khi so sánh vì normalize_vietnamese() viết hoa chữ đầu
+                    # nhưng vocab/ref_words đều lowercase
+                    decoded_words = decoded_str.lower().split() if decoded_str else []
 
                     # WER: so sánh word strings trực tiếp (không re-map indices)
                     val_edit_dist += _levenshtein(decoded_words, ref_words)
@@ -350,14 +376,14 @@ def train(args: argparse.Namespace) -> None:
                     val_correct += int(decoded_words == ref_words)
                     val_total += 1
 
-                    # Lưu tối đa 3 mẫu để in
-                    if len(sample_pairs) < 3:
-                        sample_pairs.append((decoded_str or "<empty>", " ".join(ref_words)))
+                    # Lưu 1 mẫu cho mỗi nhãn khác nhau (tối đa 5 nhãn)
+                    ref_str = " ".join(ref_words)
+                    if len(sample_pairs) < 5 and ref_str not in {r for _, r in sample_pairs}:
+                        sample_pairs.append((decoded_str or "<empty>", ref_str))
 
         avg_val = val_loss_sum / max(val_batches, 1)
         val_wer = val_edit_dist / max(val_ref_words, 1)
         val_acc = val_correct / max(val_total, 1)
-        scheduler.step(avg_val)
 
         logger.info(
             f"Epoch {epoch:03d}/{args.epochs} | "
@@ -375,21 +401,24 @@ def train(args: argparse.Namespace) -> None:
             logger.info("  ────────────────────────")
 
         # --- Save best / Early stopping ---
-        if avg_val < best_val_loss:
+        if val_wer < best_val_wer:
+            best_val_wer = val_wer
             best_val_loss = avg_val
             no_improve_count = 0
             torch.save(model.state_dict(), cfg.TRAINED_MODEL_PATH)
-            logger.info(f"  ✓ Saved best model (val_loss={avg_val:.4f})")
+            logger.info(f"  ✓ Saved best model (val_wer={val_wer:.1%}, val_loss={avg_val:.4f})")
         else:
             no_improve_count += 1
             if args.patience > 0 and no_improve_count >= args.patience:
                 logger.info(
-                    f"  Early stopping tại epoch {epoch} "
-                    f"(không cải thiện sau {args.patience} epochs)"
+                    f"  Early stopping at epoch {epoch} "
+                    f"(no WER improvement for {args.patience} epochs)"
                 )
                 break
 
-    logger.info(f"Training hoàn tất. Best val loss: {best_val_loss:.4f}")
+        scheduler.step()  # CosineAnnealingLR: step each epoch
+
+    logger.info(f"Training hoàn tất. Best val WER: {best_val_wer:.1%} | Best val loss: {best_val_loss:.4f}")
     logger.info(f"Model đã lưu tại: {cfg.TRAINED_MODEL_PATH}")
 
 
@@ -403,8 +432,8 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=cfg.LEARNING_RATE)
     parser.add_argument("--no-resume", action="store_true",
                         help="Bắt đầu train từ đầu, bỏ qua checkpoint cũ (mặc định: tự động load nếu có)")
-    parser.add_argument("--patience", type=int, default=20,
-                        help="Số epoch không cải thiện val_loss trước khi dừng sớm (0 = tắt)")
+    parser.add_argument("--patience", type=int, default=50,
+                        help="Số epoch không cải thiện val WER trước khi dừng sớm (0 = tắt)")
     args = parser.parse_args()
     train(args)
 

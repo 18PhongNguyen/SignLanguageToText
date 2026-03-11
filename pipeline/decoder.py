@@ -66,7 +66,7 @@ def _beam_search_single(
         Decoded word index list tốt nhất.
     """
     T, C = log_probs_tc.shape
-    probs = log_probs_tc.exp().cpu().float()  # (T, C)
+    probs = torch.softmax(log_probs_tc, dim=-1).cpu().float()  # (T, C) — properly normalized
 
     # beams: prefix_tuple → [p_blank, p_non_blank]
     def new_beam_dict() -> defaultdict:
@@ -132,6 +132,46 @@ def _beam_search_single(
     return list(best)
 
 
+def _word_edit_distance(a: list[str], b: list[str]) -> int:
+    """Word-level Levenshtein distance."""
+    m, n = len(a), len(b)
+    dp = list(range(n + 1))
+    for i in range(1, m + 1):
+        prev = dp[0]
+        dp[0] = i
+        for j in range(1, n + 1):
+            temp = dp[j]
+            dp[j] = prev if a[i - 1] == b[j - 1] else 1 + min(prev, dp[j], dp[j - 1])
+            prev = temp
+    return dp[n]
+
+
+def snap_to_phrase(
+    text: str,
+    phrase_list: list[str],
+    max_distance: int = 2,
+) -> str | None:
+    """Snap decoded text về phrase gần nhất trong phrase_list.
+
+    Args:
+        text:        decoded text (đã normalize)
+        phrase_list: danh sách câu biết trước từ dataset
+        max_distance: khoảng cách word-edit tối đa để chấp nhận snap
+
+    Returns:
+        Phrase khớp nhất nếu trong ngưỡng, ngược lại trả về None.
+    """
+    if not phrase_list or not text:
+        return None
+    words = text.split()
+    best_phrase, best_dist = None, max_distance + 1
+    for phrase in phrase_list:
+        d = _word_edit_distance(words, phrase.split())
+        if d < best_dist:
+            best_dist, best_phrase = d, phrase
+    return best_phrase if best_dist <= max_distance else None
+
+
 def decode_to_text(
     log_probs: torch.Tensor,
     idx2word: dict[int, str],
@@ -139,6 +179,7 @@ def decode_to_text(
     beam_width: int = 10,
     min_frames: int = 25,
     confidence_threshold: float = 0.5,
+    phrase_list: list[str] | None = None,
 ) -> list[tuple[str, float]]:
     """Beam Search decode + chuyển thành câu tiếng Việt.
 
@@ -151,6 +192,8 @@ def decode_to_text(
                               bỏ qua nếu T < min_frames (default 25)
         confidence_threshold: ngưỡng tự tin tối thiểu để chấp nhận kết quả;
                               bỏ qua nếu confidence < threshold (default 0.5)
+        phrase_list:          danh sách câu từ dataset; nếu cung cấp, kết quả
+                              sẽ được snap về phrase gần nhất (max 2 word edits).
 
     Returns:
         List[(text, confidence)] cho mỗi item trong batch.
@@ -196,14 +239,27 @@ def decode_to_text(
         words = [idx2word[idx] for idx in indices if idx in idx2word]
         text = " ".join(words)
         text = normalize_vietnamese(text)
+
+        # ── Greedy decode để kiểm tra khả năng snap ────────────
+        greedy_indices = greedy_decode(log_probs[i])[0]
+        greedy_words = [idx2word[idx] for idx in greedy_indices if idx in idx2word]
+        greedy_text = normalize_vietnamese(" ".join(greedy_words))
+
+        # ── Phrase snapping: ưu tiên greedy nếu khớp phrase ────
+        if phrase_list:
+            snapped_greedy = snap_to_phrase(greedy_text, phrase_list, max_distance=2)
+            if snapped_greedy:
+                text = snapped_greedy
+            else:
+                snapped_beam = snap_to_phrase(text, phrase_list, max_distance=2)
+                if snapped_beam:
+                    text = snapped_beam
+
         results.append((text, confidence))
 
     return results
 
 
 def normalize_vietnamese(text: str) -> str:
-    """Chuẩn hóa Unicode NFC + viết hoa đầu câu + strip."""
-    text = unicodedata.normalize("NFC", text.strip())
-    if text:
-        text = text[0].upper() + text[1:]
-    return text
+    """Chuẩn hóa Unicode NFC + strip (không viết hoa để khớp vocab lowercase)."""
+    return unicodedata.normalize("NFC", text.strip())

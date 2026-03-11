@@ -1,4 +1,4 @@
-"""Bi-LSTM + CTC model cho nhận diện ngôn ngữ ký hiệu."""
+"""CRNN (Conv1D + Bi-LSTM) + CTC model cho nhận diện ngôn ngữ ký hiệu."""
 from __future__ import annotations
 
 import torch
@@ -6,10 +6,10 @@ import torch.nn as nn
 
 
 class BiLSTMCTC(nn.Module):
-    """Bidirectional LSTM với CTC output (word-level translation).
+    """Conv1D + Bidirectional LSTM với CTC output (word-level translation).
 
     Input:  (batch, time_steps, feature_dim)
-    Output: (batch, time_steps, num_classes)  — log-probabilities per frame
+    Output: (batch, time_steps, num_classes)  — logits per frame
     """
 
     def __init__(
@@ -33,6 +33,14 @@ class BiLSTMCTC(nn.Module):
             nn.LayerNorm(hidden_dim),
         )
 
+        # Conv1D block: kernel=3, pad=1, stride=1 → T unchanged (CTC-safe)
+        self.conv = nn.Sequential(
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.ReLU(),
+        )
+
         # Bi-LSTM stack
         self.lstm = nn.LSTM(
             input_size=hidden_dim,
@@ -43,6 +51,7 @@ class BiLSTMCTC(nn.Module):
             dropout=dropout if num_layers > 1 else 0.0,
         )
 
+        self.norm = nn.LayerNorm(hidden_dim * 2)
         self.dropout = nn.Dropout(dropout)
 
         # FC: hidden_dim*2 (bidirectional) → num_classes (per frame)
@@ -53,11 +62,15 @@ class BiLSTMCTC(nn.Module):
         Args:
             x: (batch, T, feature_dim)
         Returns:
-            log_probs: (batch, T, num_classes)  — log-softmax per frame
+            logits: (batch, T, num_classes)
         """
         x = self.input_dropout(x)    # Input regularization
         x = self.projection(x)       # (B, T, hidden)
+        x = x.transpose(1, 2)        # (B, hidden, T)
+        x = self.conv(x)             # (B, hidden, T) — T unchanged
+        x = x.transpose(1, 2)        # (B, T, hidden)
         x, _ = self.lstm(x)          # (B, T, hidden*2)
+        x = self.norm(x)
         x = self.dropout(x)
         x = self.fc(x)               # (B, T, num_classes)
         return x

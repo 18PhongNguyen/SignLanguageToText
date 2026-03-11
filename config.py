@@ -46,6 +46,7 @@ FACE_MODEL_URL: str = (
 # ==========================================
 USE_FACE: bool = False  # Tắt face — 1434-dim face là nhiễu cho nhận diện cử chỉ tay
 USE_EYEBROW: bool = True  # Bật lông mày — quan trọng cho biểu cảm và ngữ pháp VSL
+USE_VELOCITY: bool = True  # Nối velocity (delta frame) → feature_dim × 2
 
 NUM_POSE_LANDMARKS: int = 33
 NUM_HAND_LANDMARKS: int = 21
@@ -65,6 +66,7 @@ EYEBROW_FEATURE_DIM: int = 33  # 5×3 + 5×3 + 3 (coords lông mày + raise + fu
 def compute_feature_dim(
     use_face: bool = USE_FACE,
     use_eyebrow: bool = USE_EYEBROW,
+    use_velocity: bool = USE_VELOCITY,
 ) -> int:
     """Tính tổng số chiều đặc trưng mỗi frame."""
     # pose + (tọa độ + góc ngón tay) × 2 tay
@@ -73,6 +75,8 @@ def compute_feature_dim(
         dim += FACE_FEATURE_DIM
     if use_eyebrow:
         dim += EYEBROW_FEATURE_DIM
+    if use_velocity:
+        dim *= 2  # velocity doubles feature dim
     return dim
 
 
@@ -84,20 +88,21 @@ FEATURE_DIM: int = compute_feature_dim()
 # ==========================================
 # MÔ HÌNH BI-LSTM
 # ==========================================
-HIDDEN_DIM: int = 256
+HIDDEN_DIM: int = 128
 NUM_LSTM_LAYERS: int = 2
-DROPOUT: float = 0.3
+DROPOUT: float = 0.4
 
 # ==========================================
 # HUẤN LUYỆN (TRAINING)
 # ==========================================
-LEARNING_RATE: float = 1e-4
+LEARNING_RATE: float = 3e-4
 BATCH_SIZE: int = 16
-NUM_EPOCHS: int = 100
-SCHEDULER_PATIENCE: int = 5
-SCHEDULER_FACTOR: float = 0.5
+NUM_EPOCHS: int = 400
+# SCHEDULER_PATIENCE / FACTOR không còn dùng (đã chuyển sang OneCycleLR)
+# SCHEDULER_PATIENCE: int = 5
+# SCHEDULER_FACTOR: float = 0.5
 MIN_SEQUENCE_LENGTH: int = 10  # Số frame tối thiểu
-WEIGHT_DECAY: float = 1e-4     # L2 regularization (AdamW)
+WEIGHT_DECAY: float = 1e-3     # L2 regularization (AdamW)
 INPUT_DROPOUT: float = 0.1     # Dropout trên input features trước projection
 
 # ==========================================

@@ -45,3 +45,5 @@ htmlcov/
 .pytest_cache/
 
 CLAUDE.md
+
+backup/
