@@ -31,29 +31,30 @@ from pathlib import Path
 
 import torch
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-RESULTS_DIR  = PROJECT_ROOT / "experiments"
-RESULTS_CSV  = RESULTS_DIR / "results.csv"
-SLTT_DIR     = PROJECT_ROOT / "models" / "sltt"
+PROJECT_ROOT   = Path(__file__).resolve().parent
+RESULTS_DIR    = PROJECT_ROOT / "experiments"
+RESULTS_CSV    = RESULTS_DIR / "results.csv"
+BILSTM_DIR     = PROJECT_ROOT / "models" / "sltt" / "bilstm"
+CONFORMER_DIR  = PROJECT_ROOT / "models" / "sltt" / "conformer"
 
 EXPERIMENTS: dict[str, dict] = {
     "A": {
         "label":     "Conformer (no aux)",
         "model":     "conformer",
         "aux_loss":  False,
-        "ckpt_name": "conformer_ctc.pt",
+        "ckpt_path": CONFORMER_DIR / "conformer_ctc.pt",
     },
     "B": {
         "label":    "Conformer + aux loss",
         "model":    "conformer",
         "aux_loss": True,
-        "ckpt_name": "conformer_ctc.pt",   # sẽ overwrite A nếu chạy cùng lúc
+        "ckpt_path": CONFORMER_DIR / "conformer_ctc.pt",
     },
     "C": {
         "label":    "BiLSTM baseline",
         "model":    "bilstm",
         "aux_loss": False,
-        "ckpt_name": "bilstm_ctc.pt",
+        "ckpt_path": BILSTM_DIR / "bilstm_ctc.pt",
     },
 }
 
@@ -72,9 +73,8 @@ def _build_cmd(exp: dict, epochs: int, batch_size: int) -> list[str]:
     return cmd
 
 
-def _read_best_from_checkpoint(ckpt_name: str) -> dict:
+def _read_best_from_checkpoint(ckpt_path: Path) -> dict:
     """Đọc best_val_wer và thông tin từ checkpoint sau khi train xong."""
-    ckpt_path = SLTT_DIR / ckpt_name
     result = {"best_val_wer": "N/A", "best_val_acc": "N/A", "epochs_trained": "N/A"}
     if not ckpt_path.exists():
         return result
@@ -88,7 +88,7 @@ def _read_best_from_checkpoint(ckpt_name: str) -> dict:
             if epoch is not None:
                 result["epochs_trained"] = str(epoch)
     except Exception as e:
-        print(f"  [WARN] Không đọc được checkpoint {ckpt_name}: {e}")
+        print(f"  [WARN] Không đọc được checkpoint {ckpt_path.name}: {e}")
     return result
 
 
@@ -132,7 +132,7 @@ def run_experiment(
         print(f"\n  [ERROR] Experiment {exp_id} thất bại (returncode={result.returncode})")
 
     # Đọc kết quả từ checkpoint
-    ckpt_info = _read_best_from_checkpoint(exp["ckpt_name"])
+    ckpt_info = _read_best_from_checkpoint(exp["ckpt_path"])
 
     row = {
         "timestamp":      datetime.now().strftime("%Y-%m-%d %H:%M:%S"),

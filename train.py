@@ -343,7 +343,7 @@ def train(args: argparse.Namespace) -> None:
             num_classes=num_classes,
             use_aux_loss=args.aux_loss,
         ).to(device)
-        _ckpt_path = os.path.join(cfg.SLTT_DIR, "conformer_ctc.pt")
+        _ckpt_path = cfg.CONFORMER_MODEL_PATH  # models/sltt/conformer/conformer_ctc.pt
         logger.info(
             f"[MODEL] SplitConformerCTC | params={sum(p.numel() for p in model.parameters()):,} "
             f"| aux_loss={args.aux_loss}"
@@ -360,7 +360,7 @@ def train(args: argparse.Namespace) -> None:
         _ckpt_path = cfg.TRAINED_MODEL_PATH
         logger.info(f"[MODEL] BiLSTMCTC | params={sum(p.numel() for p in model.parameters()):,}")
 
-    os.makedirs(cfg.SLTT_DIR, exist_ok=True)
+    os.makedirs(cfg.BILSTM_DIR if args.model == "bilstm" else cfg.CONFORMER_DIR, exist_ok=True)
     best_val_wer = float("inf")
     best_val_loss = float("inf")
     no_improve_count = 0

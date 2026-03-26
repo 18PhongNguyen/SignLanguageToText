@@ -290,7 +290,8 @@ class SplitConformerCTC(nn.Module):
         out = self.dropout(self.output_norm(out))  # (B,T,144)
         logits = self.fc(out)                       # (B,T,num_classes)
 
-        if self.use_aux_loss:
+        if self.use_aux_loss and training:
+            # Aux head chỉ dùng khi training — không cần lúc inference
             pooled     = out.mean(dim=1)              # (B,144)
             aux_logits = self.aux_fc(pooled)          # (B,num_classes)
             return logits, aux_logits

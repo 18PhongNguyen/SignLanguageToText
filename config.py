@@ -18,12 +18,21 @@ DATA_DIR: str = os.path.join(PROJECT_ROOT, "Dataset")
 FEATURES_DIR: str = os.path.join(DATA_DIR, "features")
 LABEL_FILE: str = os.path.join(DATA_DIR, "labels.csv")
 MODELS_DIR: str = os.path.join(PROJECT_ROOT, "models")
-TRAINED_MODEL_PATH: str = os.path.join(MODELS_DIR, "bilstm_ctc.pt")
 
-# MediaPipe task model files
-POSE_MODEL_PATH: str = os.path.join(MODELS_DIR, "pose_landmarker_full.task")
-HAND_MODEL_PATH: str = os.path.join(MODELS_DIR, "hand_landmarker.task")
-FACE_MODEL_PATH: str = os.path.join(MODELS_DIR, "face_landmarker.task")
+# MediaPipe task models — thư mục riêng
+MEDIAPIPE_DIR: str = os.path.join(MODELS_DIR, "mediapipe")
+POSE_MODEL_PATH: str = os.path.join(MEDIAPIPE_DIR, "pose_landmarker_full.task")
+HAND_MODEL_PATH: str = os.path.join(MEDIAPIPE_DIR, "hand_landmarker.task")
+FACE_MODEL_PATH: str = os.path.join(MEDIAPIPE_DIR, "face_landmarker.task")
+
+# SL2Text model weights — mỗi kiến trúc một thư mục con
+SLTT_DIR: str = os.path.join(MODELS_DIR, "sltt")
+BILSTM_DIR: str = os.path.join(SLTT_DIR, "bilstm")
+CONFORMER_DIR: str = os.path.join(SLTT_DIR, "conformer")
+TRAINED_MODEL_PATH: str = os.path.join(BILSTM_DIR, "bilstm_ctc.pt")
+CONFORMER_MODEL_PATH: str = os.path.join(CONFORMER_DIR, "conformer_ctc.pt")
+
+TTS_DIR: str = os.path.join(MODELS_DIR, "tts")
 
 POSE_MODEL_URL: str = (
     "https://storage.googleapis.com/mediapipe-models/"
@@ -101,19 +110,37 @@ NUM_EPOCHS: int = 400
 # SCHEDULER_PATIENCE / FACTOR không còn dùng (đã chuyển sang OneCycleLR)
 # SCHEDULER_PATIENCE: int = 5
 # SCHEDULER_FACTOR: float = 0.5
-MIN_SEQUENCE_LENGTH: int = 10  # Số frame tối thiểu
+MIN_SEQUENCE_LENGTH: int = 10  # Số frame tối thiểu để chạy model (hard gate)
+MIN_DECODE_FRAMES: int = 20    # Số frame tối thiểu để decoder tin cậy (ít hơn → bias)
+MIN_FLUSH_FRAMES: int = 25     # Số frame tối thiểu trong buffer để silence flush chạy
+                               # (< 25 frames = cử chỉ quá ngắn, dễ false positive)
 WEIGHT_DECAY: float = 1e-3     # L2 regularization (AdamW)
 INPUT_DROPOUT: float = 0.1     # Dropout trên input features trước projection
 
 # ==========================================
-# SLIDING WINDOW (INFERENCE THỜI GIAN THỰC)
+# HAND ACTIVITY DETECTION (HAD) — Dynamic Window
+# Thay thế Sliding Window cố định. Model chỉ chạy 1 lần khi phát hiện
+# ranh giới ký hiệu (End-of-Sign), buffer bao nhiêu frame thì dùng bấy nhiêu.
 # ==========================================
-WINDOW_SIZE: int = 60   # frames — đủ bao phủ cử chỉ dài nhất (~99 max, mean ~53)
-WINDOW_STRIDE: int = 10  # frames
+ENERGY_THRESHOLD: float = 0.008   # Ngưỡng động năng tay — sum(Δhand²) mỗi frame
+                                   # > threshold = tay đang di chuyển (signing)
+                                   # < threshold = tay đứng yên (hold/pause)
+                                   # 0.015→0.008: nhạy hơn cho webcam cận cảnh / tay để thấp
+PAUSE_FRAMES: int = 10                # Số frame liên tiếp energy < threshold để kích hoạt
+                                       # End-of-Sign (≈ 0.33s @30fps — phát hiện tay đứng yên)
+SILENCE_TRIGGER: int = 15         # Frames không thấy tay → flush buffer (giữ nguyên)
+MAX_BUFFER_FRAMES: int = 150      # Fail-safe: giới hạn buffer tuyệt đối, tránh OOM
+                                   # (thay MAX_BUFFER_MULTIPLIER — giờ là con số tuyệt đối)
+MIN_SIGN_FRAMES: int = 10         # Buffer < frames này → bỏ qua (vẫy tay thoáng, không phải ký hiệu)
 
-# Số lần inference liên tiếp phải cho cùng kết quả trước khi emit
-# (tránh kết quả lộn xộn khi model đang ở giữa cử chỉ)
-STABLE_THRESHOLD: int = 3
+# ==========================================
+# REJECTION — Lọc false positive
+# ==========================================
+CONFIDENCE_THRESHOLD: float = 0.55      # Ngưỡng tự tin tối thiểu (0.90 quá cao → reject kết quả đúng)
+BLANK_RATIO_THRESHOLD: float = 0.95     # >95% frame blank = noise
+ENTROPY_THRESHOLD: float = 0.45         # Nếu mean entropy chuẩn hóa >0.45 → reject
+MIN_NON_BLANK_FRAMES: int = 2           # Cần ít nhất 2 frame non-blank
+EMIT_COOLDOWN: float = 1.5              # Giây — không phát lại cùng phrase trong khoảng này
 
 # ==========================================
 # VOCABULARY — Word-level CTC
@@ -144,8 +171,8 @@ def reload_vocab() -> None:
 
 
 # ==========================================
-# TTS (Text-to-Speech)
+# TTS (Text-to-Speech) — Piper TTS (offline, ONNX)
 # ==========================================
-TTS_VOICE: str = "vi-VN-HoaiMyNeural"
+TTS_MODEL_PATH: str = os.path.join(TTS_DIR, "vi_VN-vais1000-medium.onnx")
 
 

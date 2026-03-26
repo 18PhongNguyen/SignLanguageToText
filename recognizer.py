@@ -63,7 +63,7 @@ def download_if_missing(url: str, path: str) -> None:
 
 
 def ensure_models(use_face: bool = True) -> None:
-    os.makedirs(cfg.MODELS_DIR, exist_ok=True)
+    os.makedirs(cfg.MEDIAPIPE_DIR, exist_ok=True)
     for url, path in _MODEL_DOWNLOADS:
         if "face_landmarker" in path and not use_face:
             continue
@@ -269,10 +269,29 @@ class InferenceEngine:
         self.idx2word: dict[int, str] = cfg.IDX_TO_CHAR
         self._model_type: str = "bilstm"   # dùng khi gọi forward
 
-        if os.path.exists(cfg.TRAINED_MODEL_PATH):
-            self._load_model(cfg.TRAINED_MODEL_PATH, model_override)
+        _bilstm_path    = cfg.TRAINED_MODEL_PATH       # models/sltt/bilstm/bilstm_ctc.pt
+        _conformer_path = cfg.CONFORMER_MODEL_PATH     # models/sltt/conformer/conformer_ctc.pt
+
+        # Chọn đúng checkpoint path TRƯỚC khi torch.load
+        #   auto      → conformer nếu có, else bilstm
+        #   conformer → conformer_ctc.pt (fallback bilstm nếu chưa train)
+        #   bilstm    → bilstm_ctc.pt
+        if model_override == "conformer":
+            _ckpt_path = _conformer_path
+        elif model_override == "bilstm":
+            _ckpt_path = _bilstm_path
+        else:  # "auto"
+            _ckpt_path = _conformer_path if os.path.exists(_conformer_path) else _bilstm_path
+
+        if os.path.exists(_ckpt_path):
+            self._load_model(_ckpt_path, model_override)
+        elif model_override == "conformer" and os.path.exists(_bilstm_path):
+            print("[MODEL] ⚠ Chưa có conformer_ctc.pt — fallback về bilstm_ctc.pt")
+            self._load_model(_bilstm_path, "bilstm")
+        elif os.path.exists(_bilstm_path):
+            self._load_model(_bilstm_path, "bilstm")
         else:
-            print(f"[MODEL] Chưa có model tại {cfg.TRAINED_MODEL_PATH}. Hãy train trước!")
+            print("[MODEL] Chưa có model nào. Hãy train trước: python train.py")
 
     def _load_model(self, path: str, model_override: str = "auto") -> None:
         """Load checkpoint (dict mới hoặc state_dict thuần) và khởi tạo model phù hợp."""
@@ -283,11 +302,14 @@ class InferenceEngine:
             state        = raw["model_state"]
             ckpt_type    = raw.get("model_type", "bilstm")
             num_classes  = raw.get("num_classes", state.get("fc.weight", torch.zeros(35, 1)).shape[0])
+            # Đọc use_aux_loss từ metadata — phải khởi tạo model khớp với checkpoint
+            ckpt_aux_loss = raw.get("use_aux_loss", False)
         else:
             # Legacy: state_dict thuần từ BiLSTMCTC
-            state       = raw
-            ckpt_type   = "bilstm"
-            num_classes = state["fc.weight"].shape[0]
+            state         = raw
+            ckpt_type     = "bilstm"
+            num_classes   = state["fc.weight"].shape[0]
+            ckpt_aux_loss = False
 
         # Override nếu user chỉ định --model tường minh
         model_type = ckpt_type if model_override == "auto" else model_override
@@ -300,7 +322,7 @@ class InferenceEngine:
                 self.model = SplitConformerCTC(
                     feature_dim=cfg.FEATURE_DIM,
                     num_classes=num_classes,
-                    use_aux_loss=False,   # inference không cần aux head
+                    use_aux_loss=ckpt_aux_loss,  # khớp với checkpoint (có thể có aux_fc)
                 ).to(self.device)
 
         if model_type != "conformer":

@@ -56,7 +56,7 @@ def download_if_missing(url: str, path: str) -> None:
 
 
 def ensure_models(use_face: bool = True) -> None:
-    os.makedirs(cfg.MODELS_DIR, exist_ok=True)
+    os.makedirs(cfg.MEDIAPIPE_DIR, exist_ok=True)
     for url, path in _MODEL_DOWNLOADS:
         if "face_landmarker" in path and not use_face:
             continue
@@ -173,7 +173,7 @@ def extract_keypoints(
     pose_result: mp_vision.PoseLandmarkerResult,
     hand_result: mp_vision.HandLandmarkerResult,
     face_result: mp_vision.FaceLandmarkerResult | None = None,
-    use_face: bool = True,
+    use_face: bool = False,
     use_eyebrow: bool = False,
 ) -> np.ndarray:
     """Chuyển kết quả MediaPipe Tasks → feature vector qua pipeline.extractor."""
