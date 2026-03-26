@@ -1,7 +1,6 @@
 """Text-to-Speech wrapper sử dụng edge-tts (Microsoft Edge TTS API).
 
 Hỗ trợ tiếng Việt với giọng HoaiMy / NamMinh.
-Trả về audio dạng base64 để gửi qua WebSocket.
 """
 from __future__ import annotations
 

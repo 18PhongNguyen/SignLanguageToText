@@ -13,12 +13,6 @@ torch>=2.1.0              # Bi-LSTM + CTC Loss
 loguru>=0.7.0             # Logging thay thế print
 
 # ==========================================
-# 3. BACKEND (Server API thời gian thực)
-# ==========================================
-fastapi>=0.104.0          # REST + WebSocket API
-uvicorn[standard]>=0.24.0 # ASGI server
-
-# ==========================================
-# 4. TTS (Text-to-Speech)
+# 3. TTS (Text-to-Speech)
 # ==========================================
 edge-tts>=6.1.0           # Microsoft Edge TTS (hỗ trợ tiếng Việt)

@@ -11,6 +11,7 @@ Chạy:
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import random
 import unicodedata
@@ -21,13 +22,89 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from loguru import logger
-from collections import defaultdict
+from collections import Counter, defaultdict
 from torch.utils.data import DataLoader, Dataset, Subset, WeightedRandomSampler
 
 import config as cfg
 from pipeline.model import BiLSTMCTC
 from pipeline.decoder import decode_to_text
 from vocab import build_vocab, load_vocab, vocab_to_dicts, text_to_word_indices
+
+# Model conformer — import trễ để không bắt buộc khi dùng bilstm
+_CONFORMER_AVAILABLE = True
+try:
+    from pipeline.model_conformer import SplitConformerCTC
+except ImportError:
+    _CONFORMER_AVAILABLE = False
+
+
+# =====================================================================
+# FOCAL CTC LOSS — tăng trọng số cho token khó, giảm cho token dễ
+# =====================================================================
+class FocalCTCLoss(nn.Module):
+    """CTC Loss với focal weighting theo token rarity.
+
+    Ý tưởng: token hiếm (chỉ xuất hiện trong 1-2 phrases) cần được model
+    học kỹ hơn. Thay vì đặt weight trên loss toàn batch, ta scale loss
+    theo mức "hiếm" trung bình của target tokens trong mỗi sample.
+
+    weight_i = (max_freq / freq_i) ^ alpha
+    sample_weight = mean(weight cho từng token trong target)
+
+    alpha=0.5: căn bậc hai — không quá mạnh, đủ để đẩy rare token lên.
+    """
+
+    def __init__(
+        self,
+        blank: int = 0,
+        token_counts: dict[int, int] | None = None,
+        alpha: float = 0.5,
+    ) -> None:
+        super().__init__()
+        self.ctc = nn.CTCLoss(blank=blank, reduction="none", zero_infinity=True)
+        self.alpha = alpha
+
+        # Tính weight cho mỗi token dựa trên tần suất xuất hiện
+        if token_counts:
+            max_count = max(token_counts.values())
+            self.token_weights: dict[int, float] = {
+                idx: (max_count / count) ** alpha
+                for idx, count in token_counts.items()
+            }
+            logger.info(f"[FocalCTC] Token weights (alpha={alpha}):")
+            for idx in sorted(self.token_weights, key=self.token_weights.get, reverse=True):
+                logger.info(f"  token {idx:2d}: count={token_counts[idx]:5d}  weight={self.token_weights[idx]:.3f}")
+        else:
+            self.token_weights = {}
+
+    def forward(
+        self,
+        log_probs: torch.Tensor,
+        targets: torch.Tensor,
+        input_lengths: torch.Tensor,
+        target_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        # CTC loss per sample (reduction="none")
+        losses = self.ctc(log_probs, targets, input_lengths, target_lengths)  # (B,)
+
+        if not self.token_weights:
+            return losses.mean()
+
+        # Tính weight cho mỗi sample dựa trên rare-token score
+        device = losses.device
+        B = losses.size(0)
+        weights = torch.ones(B, device=device)
+        offset = 0
+        for i in range(B):
+            tlen = int(target_lengths[i].item())
+            tgt = targets[offset:offset + tlen].tolist()
+            offset += tlen
+            if tgt:
+                w = sum(self.token_weights.get(t, 1.0) for t in tgt) / len(tgt)
+                weights[i] = w
+
+        # Weighted mean loss
+        return (losses * weights).sum() / weights.sum()
 
 
 # =====================================================================
@@ -212,14 +289,32 @@ def train(args: argparse.Namespace) -> None:
         n_v = max(1, int(len(idxs) * 0.2))
         logger.info(f"  {label_str!r:40s}  total={len(idxs):4d}  val={n_v:3d}  train={len(idxs)-n_v:4d}")
 
-    # Weighted sampler: oversample minority class ("rất vui được gặp bạn" etc.)
-    class_freq: dict[tuple, int] = defaultdict(int)
+    # Weighted sampler: token-aware — phrase chứa rare token được sample nhiều hơn
+    # Bước 1: Đếm tần suất mỗi token TRÊN TOÀN dataset (không chỉ phrase count)
+    token_counter: Counter[int] = Counter()
     for i in train_indices:
-        class_freq[tuple(dataset.samples[i][1])] += 1
-    sample_weights = torch.tensor(
-        [(1.0 / class_freq[tuple(dataset.samples[i][1])]) ** 0.5 for i in train_indices],
-        dtype=torch.float32,
-    )
+        _, tgt = dataset.samples[i]
+        token_counter.update(tgt)
+    logger.info(f"Token frequency in train set: {dict(token_counter.most_common())}")
+
+    # Bước 2: Score mỗi sample = mean(1/freq cho mỗi token) → phrase chứa
+    # rare token ("quê", "ở", "đâu") có score cao hơn nhiều
+    max_token_count = max(token_counter.values()) if token_counter else 1
+    sample_weights_list: list[float] = []
+    for i in train_indices:
+        _, tgt = dataset.samples[i]
+        # Rare-token score: token càng hiếm → score càng cao
+        token_scores = [
+            (max_token_count / token_counter.get(t, 1)) ** 0.5
+            for t in tgt
+        ]
+        # Mean score cho sample — phrase có nhiều rare token được boost nhiều hơn
+        sample_weights_list.append(sum(token_scores) / max(len(token_scores), 1))
+
+    sample_weights = torch.tensor(sample_weights_list, dtype=torch.float32)
+    logger.info(f"[SAMPLER] Token-aware weights: min={sample_weights.min():.3f} "
+                f"max={sample_weights.max():.3f} mean={sample_weights.mean():.3f}")
+
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
@@ -237,18 +332,14 @@ def train(args: argparse.Namespace) -> None:
         pin_memory=device.type == "cuda",
     )
 
-    # ── Model ──────────────────────────────────────────────────
-    model = BiLSTMCTC(
-        feature_dim=cfg.FEATURE_DIM,
-        hidden_dim=cfg.HIDDEN_DIM,
-        num_classes=num_classes,
-        num_layers=cfg.NUM_LSTM_LAYERS,
-        dropout=cfg.DROPOUT,
-        input_dropout=cfg.INPUT_DROPOUT,
-    ).to(device)
-    logger.info(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
-
-    criterion = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
+    # ── Model — xem bên dưới (phần model factory) ─────────────
+    criterion = FocalCTCLoss(
+        blank=0,
+        token_counts=dict(token_counter),
+        alpha=0.5,
+    )
+    val_criterion = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
+    logger.info("[LOSS] FocalCTCLoss (alpha=0.5) — rare token upweighted")
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
@@ -260,17 +351,47 @@ def train(args: argparse.Namespace) -> None:
         eta_min=1e-6,
     )
 
-    os.makedirs(cfg.MODELS_DIR, exist_ok=True)
+    # ── Chọn model theo flag --model ────────────────────────────
+    # Checkpoint path: bilstm dùng path gốc, conformer dùng path riêng
+    if args.model == "conformer":
+        if not _CONFORMER_AVAILABLE:
+            logger.error("pipeline/model_conformer.py không tồn tại! Hãy tạo file trước.")
+            return
+        model = SplitConformerCTC(
+            feature_dim=cfg.FEATURE_DIM,
+            num_classes=num_classes,
+            use_aux_loss=args.aux_loss,
+        ).to(device)
+        _ckpt_path = os.path.join(cfg.SLTT_DIR, "conformer_ctc.pt")
+        logger.info(
+            f"[MODEL] SplitConformerCTC | params={sum(p.numel() for p in model.parameters()):,} "
+            f"| aux_loss={args.aux_loss}"
+        )
+    else:
+        model = BiLSTMCTC(
+            feature_dim=cfg.FEATURE_DIM,
+            hidden_dim=cfg.HIDDEN_DIM,
+            num_classes=num_classes,
+            num_layers=cfg.NUM_LSTM_LAYERS,
+            dropout=cfg.DROPOUT,
+            input_dropout=cfg.INPUT_DROPOUT,
+        ).to(device)
+        _ckpt_path = cfg.TRAINED_MODEL_PATH
+        logger.info(f"[MODEL] BiLSTMCTC | params={sum(p.numel() for p in model.parameters()):,}")
+
+    os.makedirs(cfg.SLTT_DIR, exist_ok=True)
     best_val_wer = float("inf")
     best_val_loss = float("inf")
     no_improve_count = 0
 
     # ── Auto-resume from checkpoint ─────────────────────────────
-    if not args.no_resume and os.path.exists(cfg.TRAINED_MODEL_PATH):
+    if not args.no_resume and os.path.exists(_ckpt_path):
         try:
-            state = torch.load(cfg.TRAINED_MODEL_PATH, map_location=device, weights_only=True)
+            ckpt = torch.load(_ckpt_path, map_location=device, weights_only=False)
+            # Hỗ trợ cả checkpoint dict mới lẫn state_dict thuần (backward compat)
+            state = ckpt.get("model_state", ckpt) if isinstance(ckpt, dict) and "model_state" in ckpt else ckpt
             model.load_state_dict(state)
-            logger.info(f"[RESUME] Tìm thấy model cũ, tiếp tục train từ {cfg.TRAINED_MODEL_PATH}")
+            logger.info(f"[RESUME] Tìm thấy model cũ, tiếp tục train từ {_ckpt_path}")
         except RuntimeError as e:
             logger.warning(f"[RESUME] Checkpoint không tương thích (kiến trúc thay đổi), train từ đầu: {e}")
     elif args.no_resume:
@@ -304,12 +425,32 @@ def train(args: argparse.Namespace) -> None:
             # Augmentation (training only)
             padded = augment_batch(padded, input_lengths)
 
-            logits = model(padded)                        # (B, T, C)
+            # ── Forward pass (conformer hỗ trợ aux_loss) ─────────
+            if args.model == "conformer" and args.aux_loss:
+                logits, aux_logits = model(padded, training=True)  # (B,T,C), (B,C)
+            elif args.model == "conformer":
+                logits = model(padded, training=True)               # (B,T,C)
+            else:
+                logits = model(padded)                              # (B,T,C)
+
             log_probs = F.log_softmax(logits, dim=-1)     # (B, T, C)
             log_probs = log_probs.permute(1, 0, 2)        # (T, B, C) — CTC format
 
             ctc = criterion(log_probs, targets, input_lengths, target_lengths)
-            loss = ctc
+
+            # Aux loss: CE trên từ đầu tiên của mỗi sample làm proxy label
+            if args.model == "conformer" and args.aux_loss:
+                # Lấy word index đầu tiên của từng sample từ targets flat
+                first_words: list[int] = []
+                _offset = 0
+                for _i in range(len(target_lengths)):
+                    first_words.append(int(targets[_offset].item()))
+                    _offset += int(target_lengths[_i].item())
+                first_word_tensor = torch.tensor(first_words, dtype=torch.long, device=device)
+                aux_loss_val = F.cross_entropy(aux_logits, first_word_tensor)
+                loss = ctc + 0.3 * aux_loss_val
+            else:
+                loss = ctc
 
             optimizer.zero_grad()
             loss.backward()
@@ -337,11 +478,14 @@ def train(args: argparse.Namespace) -> None:
                 input_lengths = input_lengths.to(device)
                 target_lengths = target_lengths.to(device)
 
-                logits = model(padded)
+                logits = model(padded) if args.model != "conformer" else model(padded, training=False)
+                # Với conformer + aux_loss: model trả về tuple, lấy logits đầu
+                if isinstance(logits, tuple):
+                    logits = logits[0]
                 log_probs = F.log_softmax(logits, dim=-1)
                 log_probs_t = log_probs.permute(1, 0, 2)
 
-                loss = criterion(log_probs_t, targets, input_lengths, target_lengths)
+                loss = val_criterion(log_probs_t, targets, input_lengths, target_lengths)
                 val_loss_sum += loss.item()
                 val_batches += 1
 
@@ -405,8 +549,18 @@ def train(args: argparse.Namespace) -> None:
             best_val_wer = val_wer
             best_val_loss = avg_val
             no_improve_count = 0
-            torch.save(model.state_dict(), cfg.TRAINED_MODEL_PATH)
-            logger.info(f"  ✓ Saved best model (val_wer={val_wer:.1%}, val_loss={avg_val:.4f})")
+            # Lưu checkpoint dict đầy đủ để recognizer.py auto-detect model_type
+            checkpoint = {
+                "model_state": model.state_dict(),
+                "model_type": args.model,           # 'bilstm' hoặc 'conformer'
+                "use_aux_loss": getattr(args, "aux_loss", False),
+                "num_classes": num_classes,
+                "feature_dim": cfg.FEATURE_DIM,
+                "val_wer": val_wer,
+                "epoch": epoch,
+            }
+            torch.save(checkpoint, _ckpt_path)
+            logger.info(f"  ✓ Saved best model (val_wer={val_wer:.1%}, val_loss={avg_val:.4f}) → {_ckpt_path}")
         else:
             no_improve_count += 1
             if args.patience > 0 and no_improve_count >= args.patience:
@@ -419,14 +573,14 @@ def train(args: argparse.Namespace) -> None:
         scheduler.step()  # CosineAnnealingLR: step each epoch
 
     logger.info(f"Training hoàn tất. Best val WER: {best_val_wer:.1%} | Best val loss: {best_val_loss:.4f}")
-    logger.info(f"Model đã lưu tại: {cfg.TRAINED_MODEL_PATH}")
+    logger.info(f"Model đã lưu tại: {_ckpt_path}")
 
 
 # =====================================================================
 # MAIN
 # =====================================================================
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Huấn luyện Bi-LSTM + CTC")
+    parser = argparse.ArgumentParser(description="Huấn luyện Bi-LSTM + CTC / SplitConformer CTC")
     parser.add_argument("--epochs", type=int, default=cfg.NUM_EPOCHS)
     parser.add_argument("--batch-size", type=int, default=cfg.BATCH_SIZE)
     parser.add_argument("--lr", type=float, default=cfg.LEARNING_RATE)
@@ -434,7 +588,19 @@ def main() -> None:
                         help="Bắt đầu train từ đầu, bỏ qua checkpoint cũ (mặc định: tự động load nếu có)")
     parser.add_argument("--patience", type=int, default=50,
                         help="Số epoch không cải thiện val WER trước khi dừng sớm (0 = tắt)")
+    parser.add_argument(
+        "--model", type=str, default="bilstm", choices=["bilstm", "conformer"],
+        help="Kiến trúc model: 'bilstm' (mặc định) hoặc 'conformer' (SplitConformerCTC)"
+    )
+    parser.add_argument(
+        "--aux-loss", action="store_true",
+        help="Bật auxiliary loss head cho conformer (CE trên token đầu tiên). Chỉ dùng với --model conformer"
+    )
     args = parser.parse_args()
+
+    if args.aux_loss and args.model != "conformer":
+        parser.error("--aux-loss chỉ dùng được khi --model conformer")
+
     train(args)
 
 

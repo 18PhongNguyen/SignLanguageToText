@@ -13,19 +13,16 @@ Chạy:
 from __future__ import annotations
 
 import argparse
-import asyncio
+import math
 import os
-import threading
 import time
 import urllib.request
-from collections import deque
 from concurrent.futures import ThreadPoolExecutor, Future
 
 import cv2
 import mediapipe as mp
 import numpy as np
 import torch
-import torch.nn.functional as F
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 
@@ -33,6 +30,13 @@ import config as cfg
 from pipeline.model import BiLSTMCTC
 from pipeline.decoder import decode_to_text, normalize_vietnamese
 from pipeline.extractor import landmarks_to_features, augment_sequence_with_velocity
+from pipeline.tts import TTSPlayer
+
+try:
+    from pipeline.model_conformer import SplitConformerCTC
+    _CONFORMER_AVAILABLE = True
+except ImportError:
+    _CONFORMER_AVAILABLE = False
 
 try:
     from PIL import Image as _PilImage, ImageDraw as _PilDraw, ImageFont as _PilFont
@@ -192,113 +196,140 @@ def hands_visible(hand_result: mp_vision.HandLandmarkerResult) -> bool:
     return len(hand_result.hand_landmarks) > 0
 
 
-# ==========================================
-# TTS BACKGROUND PLAYER
-# ==========================================
-class TTSPlayer:
-    """Phát giọng nói TTS trong background thread (non-blocking)."""
+def extract_hand_activity(
+    hand_result: mp_vision.HandLandmarkerResult,
+) -> float:
+    """Lấy tọa độ Y tuyệt đối thấp nhất (gần đỉnh đầu nhất) của cổ tay.
 
-    def __init__(self, voice: str = cfg.TTS_VOICE, enabled: bool = True) -> None:
-        self.voice = voice
-        self.enabled = enabled
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._thread: threading.Thread | None = None
-        if enabled:
-            self._thread = threading.Thread(target=self._run_loop, daemon=True)
-            self._thread.start()
-
-    def _run_loop(self) -> None:
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-        self._loop.run_forever()
-
-    def speak(self, text: str) -> None:
-        if not self.enabled or not self._loop:
-            return
-        asyncio.run_coroutine_threadsafe(self._speak_async(text), self._loop)
-
-    async def _speak_async(self, text: str) -> None:
-        try:
-            import edge_tts
-            import tempfile
-            communicate = edge_tts.Communicate(text, self.voice)
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-                tmp_path = f.name
-            await communicate.save(tmp_path)
-            # Phát bằng system command (cross-platform)
-            if os.name == "nt":
-                # Windows: dùng PowerShell Media.SoundPlayer hoặc mpv/ffplay
-                os.system(f'start /min "" "cmd /c (for /F %I in () do @echo off) & powershell -c "(New-Object Media.SoundPlayer \'{tmp_path}\').PlaySync()" & del \"{tmp_path}\""')
-                # Fallback đơn giản hơn:
-                os.startfile(tmp_path)
-            else:
-                os.system(f"mpv --no-video --really-quiet '{tmp_path}' 2>/dev/null && rm -f '{tmp_path}' &")
-        except Exception as e:
-            print(f"[TTS] Lỗi: {e}")
+    MediaPipe hand landmark 0 = wrist.  Y trong [0,1], 0=trên, 1=dưới.
+    Nếu nhiều tay: lấy min Y (tay cao nhất — đang active nhất).
+    Nếu không có tay: trả về 1.0 (= "dưới đáy frame").
+    """
+    if not hand_result.hand_landmarks:
+        return 1.0
+    wrist_ys: list[float] = []
+    for hand_lm in hand_result.hand_landmarks:
+        wrist_ys.append(hand_lm[0].y)  # landmark 0 = wrist
+    return min(wrist_ys)
 
 
 # ==========================================
-# INFERENCE ENGINE
+# INFERENCE ENGINE — HAD State Machine + Rejection Stack
 # ==========================================
+
+# Offset tay trong feature vector 301-dim (USE_FACE=False, USE_EYEBROW=True):
+#   pose: [0:132], lh_coords: [132:195], lh_angles: [195:200],
+#   rh_coords: [200:263], rh_angles: [263:268], eyebrow: [268:301]
+_HAND_SLICE = slice(132, 268)  # 136 dims: cả 2 tay (coords + angles)
+
+
 class InferenceEngine:
-    """Quản lý buffer + model inference cho real-time recognition."""
+    """HAD (Hand Activity Detection) State Machine cho real-time sign recognition.
+
+    Thay thế Sliding Window cố định bằng Dynamic Window:
+    - IDLE: chờ tay bắt đầu di chuyển (energy > threshold)
+    - SIGNING: buffer frames liên tục cho đến khi phát hiện ranh giới ký hiệu
+    - Ranh giới (End-of-Sign):
+        A. Tay biến mất khỏi màn hình (SILENCE_TRIGGER frames)
+        B. Tay đứng yên (energy < threshold liên tục PAUSE_FRAMES frames)
+        C. Fail-safe: buffer >= MAX_BUFFER_FRAMES
+    - Flush: chạy model 1 LẦN trên toàn bộ buffer → decode → emit → reset
+
+    Lưu ý: Y_DROP (tay hạ xuống) đã bị loại bỏ — gây infer sớm khi người dùng
+    còn đang ký hiệu ở vị trí thấp.
+    """
 
     def __init__(
         self,
         use_face: bool,
         use_eyebrow: bool,
+        model_override: str = "auto",
     ) -> None:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.use_face = use_face
         self.use_eyebrow = use_eyebrow
 
-        # Buffer
-        self.frame_buffer: deque[np.ndarray] = deque(maxlen=150)
-        self._silence_frames: int = 0
-        self._silence_trigger: int = 15
-        self._min_infer_frames: int = 10
-        self._confidence_threshold: float = 0.30
+        # ── HAD State Machine ─────────────────────────────────────
+        self._state: str = "IDLE"  # "IDLE" hoặc "SIGNING"
+        self.frame_buffer: list[np.ndarray] = []
+        self._prev_features: np.ndarray | None = None  # frame trước, tính energy
+        self._current_energy: float = 0.0               # energy frame hiện tại (debug/UI)
+        self._low_energy_count: int = 0                  # đếm frame liên tiếp energy thấp
+        self._no_hand_count: int = 0                     # đếm frame liên tiếp không thấy tay
+
+        # ── Emit cooldown ─────────────────────────────────────────
         self._last_emitted: str = ""
+        self._last_emit_time: float = 0.0
 
         # Phrase list từ dataset để snap kết quả decode
         self.phrase_list: list[str] = self._load_phrase_list()
 
-        # Load model
+        # ── Load model ────────────────────────────────────────────
         self.model: BiLSTMCTC | None = None
-        self.idx2word: dict[int, str] = cfg.IDX_TO_CHAR  # fallback; overridden khi load checkpoint
-        if os.path.exists(cfg.TRAINED_MODEL_PATH):
-            # Đọc state_dict trước để lấy num_classes thực tế từ checkpoint
-            # (tránh lỗi size mismatch khi vocab thay đổi sau khi train xong)
-            state = torch.load(cfg.TRAINED_MODEL_PATH, map_location=self.device, weights_only=True)
-            ckpt_num_classes: int = state["fc.weight"].shape[0]
+        self.idx2word: dict[int, str] = cfg.IDX_TO_CHAR
+        self._model_type: str = "bilstm"   # dùng khi gọi forward
 
+        if os.path.exists(cfg.TRAINED_MODEL_PATH):
+            self._load_model(cfg.TRAINED_MODEL_PATH, model_override)
+        else:
+            print(f"[MODEL] Chưa có model tại {cfg.TRAINED_MODEL_PATH}. Hãy train trước!")
+
+    def _load_model(self, path: str, model_override: str = "auto") -> None:
+        """Load checkpoint (dict mới hoặc state_dict thuần) và khởi tạo model phù hợp."""
+        raw = torch.load(path, map_location=self.device, weights_only=False)
+
+        # Phân biệt checkpoint dict mới và state_dict thuần (backward compat)
+        if isinstance(raw, dict) and "model_state" in raw:
+            state        = raw["model_state"]
+            ckpt_type    = raw.get("model_type", "bilstm")
+            num_classes  = raw.get("num_classes", state.get("fc.weight", torch.zeros(35, 1)).shape[0])
+        else:
+            # Legacy: state_dict thuần từ BiLSTMCTC
+            state       = raw
+            ckpt_type   = "bilstm"
+            num_classes = state["fc.weight"].shape[0]
+
+        # Override nếu user chỉ định --model tường minh
+        model_type = ckpt_type if model_override == "auto" else model_override
+
+        if model_type == "conformer":
+            if not _CONFORMER_AVAILABLE:
+                print("[MODEL] ⚠ pipeline/model_conformer.py không tìm thấy! Fallback về BiLSTMCTC.")
+                model_type = "bilstm"
+            else:
+                self.model = SplitConformerCTC(
+                    feature_dim=cfg.FEATURE_DIM,
+                    num_classes=num_classes,
+                    use_aux_loss=False,   # inference không cần aux head
+                ).to(self.device)
+
+        if model_type != "conformer":
             self.model = BiLSTMCTC(
                 feature_dim=cfg.FEATURE_DIM,
                 hidden_dim=cfg.HIDDEN_DIM,
-                num_classes=ckpt_num_classes,
+                num_classes=num_classes,
                 num_layers=cfg.NUM_LSTM_LAYERS,
                 dropout=0.0,
             ).to(self.device)
-            self.model.load_state_dict(state)
-            self.model.eval()
 
-            # Build idx2word khớp đúng với số class trong checkpoint
-            from vocab import load_vocab, vocab_to_dicts
-            _vocab = load_vocab()
-            _, self.idx2word = vocab_to_dicts(_vocab[:ckpt_num_classes])
+        self.model.load_state_dict(state)
+        self.model.eval()
+        self._model_type = model_type
 
+        from vocab import load_vocab, vocab_to_dicts
+        _vocab = load_vocab()
+        _, self.idx2word = vocab_to_dicts(_vocab[:num_classes])
+
+        print(
+            f"[MODEL] Loaded từ {path} | type={model_type} | "
+            f"device={self.device} | num_classes={num_classes} "
+            f"(vocab hiện tại: {cfg.NUM_CLASSES})"
+        )
+        if num_classes != cfg.NUM_CLASSES:
             print(
-                f"[MODEL] Loaded từ {cfg.TRAINED_MODEL_PATH} | "
-                f"device={self.device} | num_classes={ckpt_num_classes} "
-                f"(vocab hiện tại: {cfg.NUM_CLASSES})"
+                f"[MODEL] ⚠ Checkpoint ({num_classes} classes) khác vocab hiện tại "
+                f"({cfg.NUM_CLASSES} classes). Cần train lại để nhận diện đầy đủ từ vựng mới."
             )
-            if ckpt_num_classes != cfg.NUM_CLASSES:
-                print(
-                    f"[MODEL] ⚠ Checkpoint ({ckpt_num_classes} classes) khác vocab hiện tại "
-                    f"({cfg.NUM_CLASSES} classes). Cần train lại để nhận diện đầy đủ từ vựng mới."
-                )
-        else:
-            print(f"[MODEL] Chưa có model tại {cfg.TRAINED_MODEL_PATH}. Hãy train trước!")
 
     @staticmethod
     def _load_phrase_list() -> list[str]:
@@ -319,87 +350,258 @@ class InferenceEngine:
             print(f"[PHRASE] Không thể load phrases: {e}")
             return []
 
+    # ──────────────────────────────────────────────────────────
+    # KINEMATIC ENERGY — tính từ feature vector raw (301-dim)
+    # ──────────────────────────────────────────────────────────
+
+    def _compute_energy(self, features: np.ndarray) -> float:
+        """Động năng tay = sum(Δhand²) giữa frame hiện tại và frame trước.
+
+        Dùng 136 dims hand data (coords + angles, cả 2 tay) trong feature vector.
+        Tọa độ là relative-to-nose nhưng velocity vẫn phản ánh chuyển động tay.
+        """
+        if self._prev_features is None:
+            return 0.0
+        delta = features[_HAND_SLICE] - self._prev_features[_HAND_SLICE]
+        return float(np.sum(delta ** 2))
+
+    # ──────────────────────────────────────────────────────────
+    # REJECTION STACK — chạy TRƯỚC beam search decode (nhanh, O(T))
+    # ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _blank_ratio(logits: torch.Tensor, blank_idx: int = 0) -> float:
+        """Tỷ lệ frame predict blank. Noise/idle thường >95%."""
+        preds = logits.argmax(dim=-1)  # (T,)
+        return float((preds == blank_idx).sum().item()) / max(preds.size(0), 1)
+
+    @staticmethod
+    def _mean_entropy(logits: torch.Tensor) -> float:
+        """Shannon entropy chuẩn hóa trung bình tại non-blank frames."""
+        probs = torch.softmax(logits, dim=-1)
+        preds = logits.argmax(dim=-1)
+        non_blank = preds != 0
+        if not non_blank.any():
+            return 1.0
+        p = probs[non_blank]
+        log_p = torch.log(p + 1e-10)
+        entropy = -(p * log_p).sum(dim=-1)
+        max_entropy = math.log(logits.size(-1))
+        normalized = entropy / max_entropy
+        return float(normalized.mean().item())
+
+    @staticmethod
+    def _non_blank_count(logits: torch.Tensor, blank_idx: int = 0) -> int:
+        """Số frame predict non-blank."""
+        preds = logits.argmax(dim=-1)
+        return int((preds != blank_idx).sum().item())
+
+    def _rejection_gate(self, logits: torch.Tensor) -> tuple[bool, str]:
+        """Chạy rejection stack 3 lớp trước decode."""
+        br = self._blank_ratio(logits, cfg.BLANK_IDX)
+        if br > cfg.BLANK_RATIO_THRESHOLD:
+            return False, f"blank_ratio={br:.2f}>{cfg.BLANK_RATIO_THRESHOLD}"
+        nb = self._non_blank_count(logits, cfg.BLANK_IDX)
+        if nb < cfg.MIN_NON_BLANK_FRAMES:
+            return False, f"non_blank={nb}<{cfg.MIN_NON_BLANK_FRAMES}"
+        ent = self._mean_entropy(logits)
+        if ent > cfg.ENTROPY_THRESHOLD:
+            return False, f"entropy={ent:.2f}>{cfg.ENTROPY_THRESHOLD}"
+        return True, "ok"
+
+    # ──────────────────────────────────────────────────────────
+    # INFERENCE — chạy trên toàn bộ buffer
+    # ──────────────────────────────────────────────────────────
+
     @torch.no_grad()
-    def _run_infer(self) -> tuple[str | None, float]:
-        if self.model is None or len(self.frame_buffer) < self._min_infer_frames:
-            self.frame_buffer.clear()
+    def _run_infer_window(self, frames: np.ndarray) -> tuple[str | None, float]:
+        """Infer trên một chuỗi frames. KHÔNG xóa buffer.
+
+        Args:
+            frames: (T, raw_feature_dim) numpy array
+
+        Returns:
+            (text, confidence) hoặc (None, 0.0)
+        """
+        if self.model is None or len(frames) < cfg.MIN_SEQUENCE_LENGTH:
             return None, 0.0
 
-        window = np.array(list(self.frame_buffer))
-        self.frame_buffer.clear()
-        self._silence_frames = 0
-
+        window = frames.copy()
         if cfg.USE_VELOCITY:
             window = augment_sequence_with_velocity(window)
 
         x = torch.tensor(window, dtype=torch.float32).unsqueeze(0).to(self.device)
-        logits = self.model(x)
+        # Conformer nhận training=False để tắt modality dropout
+        if self._model_type == "conformer":
+            out = self.model(x, training=False)
+            logits = out[0] if isinstance(out, tuple) else out
+        else:
+            logits = self.model(x)  # (1, T, C)
+        logits_single = logits[0]  # (T, C)
 
-        results = decode_to_text(logits, self.idx2word, blank_idx=cfg.BLANK_IDX, phrase_list=self.phrase_list)
+        # ── Debug info ──────────────────────────────────────
+        _br = self._blank_ratio(logits_single, cfg.BLANK_IDX)
+        _nb = self._non_blank_count(logits_single, cfg.BLANK_IDX)
+        _ent = self._mean_entropy(logits_single)
+        _feat_mean = float(np.abs(frames).mean())
+        print(
+            f"[INFER] T={len(frames)} feat_mean={_feat_mean:.4f} | "
+            f"br={_br:.2f} nb={_nb} ent={_ent:.2f}"
+        )
+
+        # ── Rejection gate ──────────────────────────────────
+        passed, reason = self._rejection_gate(logits_single)
+        if not passed:
+            print(f"[REJECT] {reason}")
+            return None, 0.0
+
+        # ── Decode (beam search + phrase snap) ──────────────
+        results = decode_to_text(
+            logits,
+            self.idx2word,
+            blank_idx=cfg.BLANK_IDX,
+            confidence_threshold=cfg.CONFIDENCE_THRESHOLD,
+            phrase_list=self.phrase_list,
+            min_frames=cfg.MIN_DECODE_FRAMES,
+        )
         text, confidence = results[0]
 
-        # Debug: in ra chuỗi token CTC để chẩn đoán xem "khỏe" có bị bỏ qua không
-        _probs_np = torch.softmax(logits[0], dim=-1).cpu().numpy()  # (T, C)
-        _preds = _probs_np.argmax(axis=-1)  # (T,)
+        # ── Debug decode output ─────────────────────────────
+        _probs_np = torch.softmax(logits_single, dim=-1).cpu().numpy()
+        _preds = _probs_np.argmax(axis=-1)
         _tokens = [self.idx2word.get(int(p), f"?{p}") for p in _preds]
         _summary, _prev = [], None
         for t in _tokens:
             if t != _prev:
                 _summary.append(t)
                 _prev = t
-        print(f"[CTC raw] {' → '.join(_summary)} | decoded={text!r} conf={confidence:.2f}")
+        print(
+            f"[CTC raw] {' → '.join(_summary)} | "
+            f"decoded={text!r} conf={confidence:.2f}"
+        )
 
         if not text or text.strip().lower() == "blank":
             return None, confidence
 
-        if confidence < self._confidence_threshold:
-            return None, confidence
-
         return text, confidence
 
-    def feed_frame(self, features: np.ndarray, has_hands: bool) -> tuple[str | None, float]:
-        """Thêm 1 frame và trả về kết quả nếu có.
+    # ──────────────────────────────────────────────────────────
+    # FLUSH + RESET
+    # ──────────────────────────────────────────────────────────
+
+    def _flush_and_infer(self) -> tuple[str | None, float]:
+        """Flush toàn bộ buffer vào model, trả về kết quả."""
+        if len(self.frame_buffer) < cfg.MIN_SIGN_FRAMES:
+            print(f"[SKIP] Buffer quá ngắn: {len(self.frame_buffer)} < {cfg.MIN_SIGN_FRAMES}")
+            return None, 0.0
+        frames = np.array(self.frame_buffer)
+        text, conf = self._run_infer_window(frames)
+        if text:
+            return self._try_emit(text, conf)
+        return None, 0.0
+
+    def _reset_to_idle(self) -> None:
+        """Reset state machine về IDLE, clear buffer."""
+        self._state = "IDLE"
+        self.frame_buffer.clear()
+        self._low_energy_count = 0
+        self._no_hand_count = 0
+        # Giữ _prev_features cho transition tiếp theo
+
+    # ──────────────────────────────────────────────────────────
+    # EMIT — cooldown + duplicate check
+    # ──────────────────────────────────────────────────────────
+
+    def _try_emit(self, text: str, confidence: float) -> tuple[str | None, float]:
+        """Kiểm tra cooldown + duplicate trước khi emit."""
+        now = time.time()
+        if text == self._last_emitted and (now - self._last_emit_time) < cfg.EMIT_COOLDOWN:
+            return None, 0.0
+        clean = text.strip().lower()
+        if "blank" in clean or clean == "x" or clean == "neutral":
+            return None, 0.0
+        self._last_emitted = text
+        self._last_emit_time = now
+        return text, confidence
+
+    # ──────────────────────────────────────────────────────────
+    # FEED FRAME — entry point chính, gọi mỗi frame từ main loop
+    # ──────────────────────────────────────────────────────────
+
+    def feed_frame(
+        self,
+        features: np.ndarray,
+        has_hands: bool,
+        wrist_y: float,
+    ) -> tuple[str | None, float]:
+        """Thêm 1 frame vào HAD state machine, trả về kết quả nếu phát hiện ranh giới.
+
+        Args:
+            features: 301-dim raw feature vector (chưa velocity)
+            has_hands: MediaPipe có detect tay không
+            wrist_y: tọa độ Y tuyệt đối cổ tay (0=trên, 1=dưới), 1.0 nếu không có tay
 
         Returns: (text, confidence) hoặc (None, 0.0)
         """
-        raw_text: str | None = None
-        confidence: float = 0.0
+        # ── Tính động năng tay ────────────────────────────────
+        energy = self._compute_energy(features)
+        self._current_energy = energy
+        self._prev_features = features.copy()
 
-        if has_hands:
-            if self._silence_frames > 0:
-                self._last_emitted = ""
-            self.frame_buffer.append(features)
-            self._silence_frames = 0
+        # ══════════════════════════════════════════════════════
+        # STATE: IDLE — chờ tay bắt đầu signing
+        # ══════════════════════════════════════════════════════
+        if self._state == "IDLE":
+            # Chỉ cần có tay + cử động → bắt đầu ghi
+            # KHÔNG kiểm tra wrist_y ở đây — Y_DROP chỉ dùng để KẾT THÚC
+            if has_hands and energy > cfg.ENERGY_THRESHOLD:
+                self._state = "SIGNING"
+                self.frame_buffer.append(features)
+                self._low_energy_count = 0
+                self._no_hand_count = 0
+                print(
+                    f"[STATE] IDLE → SIGNING "
+                    f"(energy={energy:.4f}, wrist_y={wrist_y:.2f})"
+                )
+            return None, 0.0
 
-            # Buffer overflow → infer bắt buộc
-            if len(self.frame_buffer) == 150:
-                raw_text, confidence = self._run_infer()
+        # ══════════════════════════════════════════════════════
+        # STATE: SIGNING — đang buffer frames
+        # ══════════════════════════════════════════════════════
+        self.frame_buffer.append(features)
+        end_reason: str | None = None
 
+        # Condition A: Tay biến mất
+        if not has_hands:
+            self._no_hand_count += 1
+            if self._no_hand_count >= cfg.SILENCE_TRIGGER:
+                end_reason = "silence"
         else:
-            self._silence_frames += 1
+            self._no_hand_count = 0
 
-            # Dừng tay → dịch
-            if (
-                self._silence_frames >= self._silence_trigger
-                and self._silence_frames < self._silence_trigger + 5
-                and len(self.frame_buffer) >= self._min_infer_frames
-            ):
-                raw_text, confidence = self._run_infer()
+        # Condition B: Pause — tay đứng yên (energy thấp liên tục)
+        if end_reason is None:
+            if energy < cfg.ENERGY_THRESHOLD:
+                self._low_energy_count += 1
+                if self._low_energy_count >= cfg.PAUSE_FRAMES:
+                    end_reason = "pause"
+            else:
+                self._low_energy_count = 0
 
-            # Im lặng quá lâu → clear
-            elif self._silence_frames > self._silence_trigger + 5:
-                self.frame_buffer.clear()
-                self._last_emitted = ""
+        # Fail-safe: buffer quá dài
+        if end_reason is None and len(self.frame_buffer) >= cfg.MAX_BUFFER_FRAMES:
+            end_reason = "max_buffer"
 
-        # Filter
-        if raw_text:
-            clean = raw_text.strip().lower()
-            if "blank" in clean or clean == "x" or clean == "neutral":
-                raw_text = None
-
-        if raw_text and raw_text != self._last_emitted:
-            self._last_emitted = raw_text
-            return raw_text, confidence
+        # ── Flush nếu phát hiện ranh giới ─────────────────────
+        if end_reason:
+            buf_len = len(self.frame_buffer)
+            print(
+                f"[STATE] SIGNING → IDLE "
+                f"(reason={end_reason}, buffer={buf_len}f)"
+            )
+            result = self._flush_and_infer()
+            self._reset_to_idle()
+            return result
 
         return None, 0.0
 
@@ -412,6 +614,10 @@ def main() -> None:
     parser.add_argument("--no-face", action="store_true", help="Không dùng face landmarks")
     parser.add_argument("--no-eyebrow", action="store_true", help="Không dùng eyebrow features")
     parser.add_argument("--no-tts", action="store_true", help="Tắt giọng nói TTS")
+    parser.add_argument(
+        "--model", type=str, default="auto", choices=["auto", "bilstm", "conformer"],
+        help="Override model type (mặc định 'auto' = đọc từ checkpoint)"
+    )
     args = parser.parse_args()
 
     # Mặc định theo config (khớp với lúc train model)
@@ -425,8 +631,8 @@ def main() -> None:
     ensure_models(_need_face)
 
     # ── Inference engine ───────────────────────────────────────
-    engine = InferenceEngine(use_face, use_eyebrow)
-    tts = TTSPlayer(enabled=not args.no_tts)
+    engine = InferenceEngine(use_face, use_eyebrow, model_override=args.model)
+    tts = TTSPlayer(model_path=cfg.TTS_MODEL_PATH, enabled=not args.no_tts)
 
     # ── Camera ─────────────────────────────────────────────────
     cap = cv2.VideoCapture(0)
@@ -487,7 +693,7 @@ def main() -> None:
     cv2.namedWindow("SL2Text — Recognizer", cv2.WINDOW_NORMAL)
 
     print("\n--- NHẬN DIỆN NGÔN NGỮ KÝ HIỆU ---")
-    print("Thực hiện cử chỉ trước camera, dừng tay để nhận diện.")
+    print("Thực hiện cử chỉ trước camera — kết quả hiển thị TRONG LÚC ra ký hiệu.")
     print("Nhấn [C] để xóa lịch sử | [Q] để thoát.\n")
 
     try:
@@ -537,7 +743,8 @@ def main() -> None:
                 pose_result, hand_result, face_result, use_face, use_eyebrow
             )
             has_hands = hands_visible(hand_result)
-            text, confidence = engine.feed_frame(features, has_hands)
+            wrist_y = extract_hand_activity(hand_result)
+            text, confidence = engine.feed_frame(features, has_hands, wrist_y)
 
             if text:
                 current_text = text
@@ -551,17 +758,16 @@ def main() -> None:
 
             # ── Hiển thị UI ────────────────────────────────────
             buf_len = len(engine.frame_buffer)
-            silence = engine._silence_frames
 
-            # Status bar trên cùng
-            if has_hands:
-                status = f"Dang ghi... | Buffer: {buf_len} frames"
+            # Status bar trên cùng — HAD state machine
+            if engine._state == "SIGNING":
+                status = (
+                    f"SIGNING | Buffer: {buf_len} | "
+                    f"Energy: {engine._current_energy:.4f}"
+                )
                 status_color = (0, 255, 255)
-            elif buf_len > 0:
-                status = f"Dang cho... | Buffer: {buf_len} | Silence: {silence}"
-                status_color = (0, 200, 200)
             else:
-                status = "San sang — Hay lam cu chi"
+                status = "IDLE — Hay lam cu chi"
                 status_color = (0, 255, 0)
 
             cv2.putText(image, status, (10, 30),
@@ -599,9 +805,11 @@ def main() -> None:
                 recognized_history.clear()
                 current_text = ""
                 engine._last_emitted = ""
+                engine._reset_to_idle()
                 print("[INFO] Đã xóa lịch sử.")
 
     finally:
+        tts.shutdown()
         _executor.shutdown(wait=False)
         pose_lm.close()
         hand_lm.close()

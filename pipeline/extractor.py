@@ -231,7 +231,7 @@ def landmarks_json_to_array(
     use_face: bool = True,
     use_eyebrow: bool = False,
 ) -> np.ndarray:
-    """Shortcut: nhận dict JSON từ frontend WebSocket → feature array.
+    """Shortcut: nhận dict JSON landmarks → feature array.
 
     Expected JSON::
 
