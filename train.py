@@ -332,25 +332,6 @@ def train(args: argparse.Namespace) -> None:
         pin_memory=device.type == "cuda",
     )
 
-    # ── Model — xem bên dưới (phần model factory) ─────────────
-    criterion = FocalCTCLoss(
-        blank=0,
-        token_counts=dict(token_counter),
-        alpha=0.5,
-    )
-    val_criterion = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
-    logger.info("[LOSS] FocalCTCLoss (alpha=0.5) — rare token upweighted")
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=cfg.WEIGHT_DECAY,
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=args.epochs,
-        eta_min=1e-6,
-    )
-
     # ── Chọn model theo flag --model ────────────────────────────
     # Checkpoint path: bilstm dùng path gốc, conformer dùng path riêng
     if args.model == "conformer":
@@ -398,6 +379,25 @@ def train(args: argparse.Namespace) -> None:
         logger.info("[RESUME] Bỏ qua checkpoint, bắt đầu train từ đầu (--no-resume).")
     else:
         logger.info("[RESUME] Chưa có checkpoint, bắt đầu train mới.")
+
+    # ── Criterion / Optimizer / Scheduler ──────────────────────
+    criterion = FocalCTCLoss(
+        blank=0,
+        token_counts=dict(token_counter),
+        alpha=0.5,
+    )
+    val_criterion = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
+    logger.info("[LOSS] FocalCTCLoss (alpha=0.5) — rare token upweighted")
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=cfg.WEIGHT_DECAY,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=args.epochs,
+        eta_min=1e-6,
+    )
 
     # ── Helper: word-level Levenshtein distance ─────────────────
     def _levenshtein(a: list, b: list) -> int:
